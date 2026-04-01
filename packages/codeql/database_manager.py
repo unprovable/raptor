@@ -8,9 +8,13 @@ validation, and cleanup.
 
 import hashlib
 import json
+import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
@@ -330,21 +334,34 @@ class DatabaseManager:
             f"--source-root={repo_path}",
         ]
 
-        # Add build command if provided
-        if build_system and build_system.command:
-            cmd.append(f"--command={build_system.command}")
-            logger.info(f"Build command: {build_system.command}")
-            logger.info(f"Working directory: {build_system.working_dir}")
-        else:
-            logger.info("No build command (interpreted language or no-build mode)")
-
-        # Set up environment
+        # Set working directory and environment
+        working_dir = build_system.working_dir if build_system else repo_path
         env = RaptorConfig.get_safe_env()
         if build_system and build_system.env_vars:
             env.update(build_system.env_vars)
 
-        # Set working directory
-        working_dir = build_system.working_dir if build_system else repo_path
+        # Add build command if provided.
+        # CodeQL splits --command on whitespace without shell interpretation,
+        # so shell operators (&&, ||, ;, |) break. Wrap in a script unless
+        # the command is already a path to an executable (e.g. synthesised builds).
+        build_script = None
+        if build_system and build_system.command:
+            build_cmd = build_system.command
+            if Path(build_cmd).is_file() or re.fullmatch(r'[a-zA-Z0-9._-]+', build_cmd):
+                cmd.extend(["--command", build_cmd])
+            else:
+                fd, script_name = tempfile.mkstemp(
+                    prefix=".raptor_codeql_build_", suffix=".sh", dir=working_dir,
+                )
+                os.close(fd)
+                build_script = Path(script_name)
+                build_script.write_text(f"#!/bin/bash\n{build_cmd}\n")
+                build_script.chmod(build_script.stat().st_mode | stat.S_IEXEC)
+                cmd.extend(["--command", str(build_script)])
+            logger.info(f"Build command: {build_system.command}")
+            logger.info(f"Working directory: {working_dir}")
+        else:
+            logger.info("No build command (interpreted language or no-build mode)")
 
         logger.info(f"Executing: {' '.join(cmd)}")
         logger.info(f"Timeout: {RaptorConfig.CODEQL_TIMEOUT}s")
@@ -430,6 +447,10 @@ class DatabaseManager:
                 duration_seconds=time.time() - start_time,
                 cached=False,
             )
+
+        finally:
+            if build_script and build_script.exists():
+                build_script.unlink()
 
     def create_databases_parallel(
         self,
