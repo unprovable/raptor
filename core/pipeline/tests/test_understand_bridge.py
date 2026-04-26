@@ -774,7 +774,7 @@ class TestBuildChecklistScript:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
 
-        repo_root = Path(__file__).parents[3]  # core/tests -> repo root
+        repo_root = Path(__file__).parents[3]  # core/pipeline/tests -> repo root
         result = subprocess.run(
             ["libexec/raptor-build-checklist", str(target), str(out_dir)],
             capture_output=True, text=True, cwd=repo_root,
