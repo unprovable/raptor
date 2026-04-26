@@ -19,10 +19,6 @@ def get_out_dir() -> Path:
     base = os.environ.get("RAPTOR_OUT_DIR")
     return Path(base).resolve() if base else Path("out").resolve()
 
-def safe_clone(url: str, dest: Path):
-    clone_repository(url, dest, depth=1)
-    return dest
-
 def inventory(path: Path):
     counts = {}
     langs = {}
@@ -57,7 +53,8 @@ def main():
     repo_path = None
     try:
         if args.repo.startswith('http://') or args.repo.startswith('https://') or args.repo.startswith('git@'):
-            repo_path = safe_clone(args.repo, tmp / 'repo')
+            repo_path = tmp / 'repo'
+            clone_repository(args.repo, repo_path, depth=1)
         else:
             repo_path = Path(args.repo).resolve()
             if not repo_path.exists():

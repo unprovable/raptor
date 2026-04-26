@@ -16,44 +16,7 @@ _scanner_mod = importlib.util.module_from_spec(_spec)
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 _spec.loader.exec_module(_scanner_mod)
 
-safe_clone = _scanner_mod.safe_clone
 run_codeql = _scanner_mod.run_codeql
-
-
-# ---------------------------------------------------------------------------
-# safe_clone()  — thin wrapper around core.git.clone_repository
-# ---------------------------------------------------------------------------
-
-class TestSafeClone:
-
-    @patch.object(_scanner_mod, "clone_repository")
-    def test_returns_repo_subdir(self, mock_clone, tmp_path):
-        """safe_clone() should return workdir/repo."""
-        mock_clone.return_value = True
-        result = safe_clone("https://github.com/example/repo", tmp_path)
-        assert result == tmp_path / "repo"
-
-    @patch.object(_scanner_mod, "clone_repository")
-    def test_delegates_to_core_clone(self, mock_clone, tmp_path):
-        """safe_clone() must call core.git.clone_repository with depth=1."""
-        mock_clone.return_value = True
-        safe_clone("https://github.com/example/repo", tmp_path)
-        mock_clone.assert_called_once_with(
-            "https://github.com/example/repo",
-            tmp_path / "repo",
-            depth=1,
-        )
-
-    def test_invalid_url_raises(self, tmp_path):
-        """Invalid URLs must be rejected by core.git.clone_repository."""
-        with pytest.raises((ValueError, RuntimeError)):
-            safe_clone("https://evil.com/bad/repo", tmp_path)
-
-    @patch.object(_scanner_mod, "clone_repository")
-    def test_clone_failure_propagates(self, mock_clone, tmp_path):
-        mock_clone.side_effect = RuntimeError("git clone failed: not found")
-        with pytest.raises(RuntimeError, match="git clone failed"):
-            safe_clone("https://github.com/example/repo", tmp_path)
 
 
 # ---------------------------------------------------------------------------
