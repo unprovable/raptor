@@ -12,19 +12,30 @@ _SAFE_ID_RE = re.compile(r'[^A-Za-z0-9_-]')
 def sanitize(text: str, max_len: int = None) -> str:
     """Escape characters that break Mermaid node labels.
 
+    This sanitizer is for quoted node labels and similarly quoted text. It does
+    not escape ``|`` because Mermaid uses that character as edge-label syntax;
+    callers must not pass user-controlled text into unquoted edge labels.
+
     Args:
         text: Raw label text.
-        max_len: Truncate to this length with '...' suffix.
+        max_len: Truncate the escaped text to this length with '...' suffix.
+                 Because truncation happens after HTML entity escaping, the
+                 result may cut through an entity (for example, ``&am...``);
+                 this is cosmetic only, not a Mermaid injection boundary.
                  Pass None to disable truncation (default).
     """
     result = (
         str(text)
+        .replace("&", "&amp;")
         .replace('"', "'")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace("{", "(")
         .replace("}", ")")
         .replace("\n", " ")
+        .replace("\r", " ")
+        .replace("\u2028", " ")
+        .replace("\u2029", " ")
     )
     if max_len and len(result) > max_len:
         result = result[:max_len - 3] + "..."
@@ -40,4 +51,5 @@ def sanitize_id(node_id: str) -> str:
 
     Strips everything except [A-Za-z0-9_-].
     """
-    return _SAFE_ID_RE.sub('_', str(node_id)) or "node"
+    sanitized = _SAFE_ID_RE.sub('_', str(node_id))
+    return sanitized if sanitized.strip('_') else "node"

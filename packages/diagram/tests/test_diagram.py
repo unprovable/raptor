@@ -2,12 +2,9 @@
 """Tests for the diagram generation package."""
 
 import json
-import tempfile
 from pathlib import Path
 
-import pytest
-
-from ..sanitize import sanitize
+from ..sanitize import sanitize, sanitize_id
 from ..findings_summary import generate_verdict_pie, generate_type_pie
 from ..context_map import generate as gen_context_map
 from ..flow_trace import generate as gen_flow_trace
@@ -15,6 +12,40 @@ from ..attack_tree import generate as gen_attack_tree
 from ..attack_paths import generate as gen_attack_paths, generate_single
 from ..hypotheses import generate as gen_hypotheses
 from ..renderer import render_directory, render_and_write
+
+
+def assert_no_mermaid_directive_injection(output: str) -> None:
+    """Assert payloads did not break out into Mermaid directive lines."""
+    assert "\n    click " not in output.lower()
+
+
+def assert_usable_mermaid_flowchart(output: str) -> None:
+    """Assert generated Mermaid remains a recognizable, renderable flowchart."""
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    assert lines, "Mermaid output is empty"
+    assert lines[0] in {"flowchart TD", "flowchart LR"}
+    assert any("-->" in line or "-." in line for line in lines), "flowchart has no edges"
+    assert any("[\"" in line or "[/\"" in line or "([\"" in line for line in lines), "flowchart has no labelled nodes"
+    assert "```" not in output, "raw flowchart generators should not emit markdown fences"
+
+
+def extract_mermaid_blocks(markdown: str) -> list[str]:
+    """Return the contents of fenced Mermaid blocks from rendered markdown."""
+    blocks: list[str] = []
+    in_block = False
+    current: list[str] = []
+    for line in markdown.splitlines():
+        if line.strip() == "```mermaid":
+            in_block = True
+            current = []
+            continue
+        if in_block and line.strip() == "```":
+            blocks.append("\n".join(current).strip())
+            in_block = False
+            continue
+        if in_block:
+            current.append(line)
+    return blocks
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +80,33 @@ class TestSanitize:
     def test_no_truncation_by_default(self):
         long = "a" * 200
         assert len(sanitize(long)) == 200
+
+    def test_ampersand_escaped_before_angle_brackets(self):
+        result = sanitize("Tom & Jerry <script>")
+        assert "&amp;" in result
+        assert "&lt;script&gt;" in result
+
+    def test_sanitize_id_removes_mermaid_callback_injection_chars(self):
+        payload = "node1; click node1 javascript:alert(1)"
+        result = sanitize_id(payload)
+        assert ";" not in result
+        assert " " not in result
+        assert ":" not in result
+        assert "(" not in result
+        assert ")" not in result
+
+    def test_sanitize_id_never_returns_empty(self):
+        assert sanitize_id("!@#$%^*()[]{}") == "node"
+
+    def test_sanitize_id_preserves_replacement_position(self):
+        assert sanitize_id("A!") == "A_"
+        assert sanitize_id("!A") == "_A"
+
+    def test_line_separator_chars_removed(self):
+        result = sanitize("safe\rclick X javascript:alert(1)\u2028more\u2029text")
+        assert "\r" not in result
+        assert "\u2028" not in result
+        assert "\u2029" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +159,11 @@ class TestFindingsSummary:
         out = generate_verdict_pie(findings)
         assert "Exploitable" in out
         assert "False Positive" in out
+
+    def test_pie_labels_are_sanitized(self):
+        payload = "xss\"\n    click X javascript:alert(1)\n    X[\""
+        out = generate_type_pie([{"vuln_type": payload}])
+        assert_no_mermaid_directive_injection(out)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +352,44 @@ class TestContextMap:
         # HTML-escaped angle brackets should be present
         assert "&lt;" in out or "&gt;" in out
 
+    def test_sanitized_context_map_is_still_usable_mermaid(self):
+        data = {
+            "entry_points": [
+                {"id": "EP-001; click EP-001 javascript:alert(1)", "path": "/api/<tenant>"}
+            ],
+            "boundary_details": [
+                {"id": "TB-001; click TB-001 javascript:alert(1)", "covers": ["EP-001"]}
+            ],
+            "sink_details": [
+                {"id": "SINK-001; click SINK-001 javascript:alert(1)", "operation": "open().write()"}
+            ],
+        }
+        out = gen_context_map(data)
+        assert_no_mermaid_directive_injection(out)
+        assert_usable_mermaid_flowchart(out)
+
+    def test_class_assignments_use_sanitized_ids(self):
+        data = {
+            "entry_points": [
+                {"id": "EP-001; click EP-001 javascript:alert(1)", "path": "/"}
+            ],
+            "boundary_details": [
+                {"id": "TB-001; click TB-001 javascript:alert(1)", "covers": []}
+            ],
+            "sink_details": [
+                {"id": "SINK-001; click SINK-001 javascript:alert(1)", "operation": "sink"}
+            ],
+        }
+        out = gen_context_map(data)
+        class_lines = [line.strip() for line in out.splitlines() if line.strip().startswith("class ")]
+        assert class_lines
+        assert all(";" not in line for line in class_lines)
+        assert all("javascript:" not in line for line in class_lines)
+        assert all(" click " not in line for line in class_lines)
+        assert f"class {sanitize_id(data['entry_points'][0]['id'])} ep" in out
+        assert f"class {sanitize_id(data['boundary_details'][0]['id'])} tb" in out
+        assert f"class {sanitize_id(data['sink_details'][0]['id'])} sink" in out
+
 
 # ---------------------------------------------------------------------------
 # flow_trace tests
@@ -381,6 +482,82 @@ class TestFlowTrace:
         assert "S2 -. \"branch\" .-> BR1" in out
 
 
+    def test_step_ids_and_class_assignments_are_sanitized(self):
+        data = {
+            "id": "TRACE-X",
+            "name": "malicious step id",
+            "steps": [
+                {
+                    "step": "1; click S1 javascript:alert(1)",
+                    "type": "entry",
+                    "definition": "src/routes.py:10",
+                    "description": "entry",
+                }
+            ],
+            "branches": [{"branch_point": "src/routes.py:10", "condition": "x", "outcome": "y"}],
+        }
+        out = gen_flow_trace(data)
+        assert_no_mermaid_directive_injection(out)
+        assert "class S1__click_S1_javascript_alert_1_ entry" in out
+        assert "S1__click_S1_javascript_alert_1_ -. \"branch\" .-> BR1" in out
+
+    def test_label_fields_do_not_escape_into_directives(self):
+        payload = "X\"]\n    click X javascript:alert(1)\n    Y[\""
+        data = {
+            "id": "TRACE-X",
+            "name": payload,
+            "steps": [
+                {
+                    "step": 1,
+                    "type": payload,
+                    "definition": payload,
+                    "description": payload,
+                    "tainted_var": payload,
+                    "confidence": payload,
+                }
+            ],
+            "branches": [{"branch_point": payload, "condition": payload, "outcome": payload}],
+            "attacker_control": {"level": payload, "what": payload},
+        }
+        assert_no_mermaid_directive_injection(gen_flow_trace(data))
+
+    def test_sanitized_flow_trace_is_still_usable_mermaid(self):
+        payload = "X\"]\n    click X javascript:alert(1)\n    Y[\""
+        data = {
+            "id": "TRACE-X",
+            "name": payload,
+            "steps": [
+                {"step": 1, "type": "entry", "definition": "src/routes.py:10", "description": payload},
+                {"step": 2, "type": "sink", "definition": "src/db.py:50", "description": "write"},
+            ],
+            "branches": [{"branch_point": "src/routes.py:10", "condition": payload, "outcome": payload}],
+        }
+        out = gen_flow_trace(data)
+        assert_no_mermaid_directive_injection(out)
+        assert_usable_mermaid_flowchart(out)
+
+    def test_uppercase_step_type_preserves_escaped_entities(self):
+        out = gen_flow_trace({
+            "id": "TRACE-X",
+            "name": "trace",
+            "steps": [{"step": 1, "type": "<sink>", "definition": "src/db.py:50"}],
+        })
+        assert "&lt;SINK&gt;" in out
+        assert "&LT;" not in out
+        assert "&GT;" not in out
+
+    def test_uppercase_attacker_control_level_preserves_escaped_entities(self):
+        out = gen_flow_trace({
+            "id": "TRACE-X",
+            "name": "trace",
+            "steps": [{"step": 1, "type": "entry", "definition": "src/routes.py:10"}],
+            "attacker_control": {"level": "<high>", "what": "query"},
+        })
+        assert "Attacker control: &lt;HIGH&gt;" in out
+        assert "&LT;" not in out
+        assert "&GT;" not in out
+
+
 # ---------------------------------------------------------------------------
 # attack_tree tests
 # ---------------------------------------------------------------------------
@@ -419,7 +596,7 @@ class TestAttackTree:
         out = gen_attack_tree(ATTACK_TREE_DATA)
         # N1 and N2 have empty leads_to, so no outgoing edges from them
         lines = out.splitlines()
-        n1_edges = [l for l in lines if l.strip().startswith("N1 -->")]
+        n1_edges = [line for line in lines if line.strip().startswith("N1 -->")]
         assert not n1_edges
 
     def test_confirmed_node_shows_proximity_when_provided(self):
@@ -469,6 +646,33 @@ class TestAttackTree:
         assert "subgraph" not in out
 
 
+    def test_status_and_hypothesis_enrichment_are_sanitized(self):
+        payload = "X\"]\n    click X javascript:alert(1)\n    Y[\""
+        tree = {
+            "root": "ROOT",
+            "nodes": [
+                {"id": "ROOT", "goal": "root", "status": payload, "leads_to": "N1"},
+                {"id": "N1", "goal": "child", "status": "confirmed", "leads_to": ""},
+            ],
+        }
+        hypotheses = [{"finding": "N1", "status": payload, "claim": payload}]
+        assert_no_mermaid_directive_injection(gen_attack_tree(tree, hypotheses=hypotheses))
+
+    def test_status_group_keys_do_not_keep_raw_status_text(self):
+        payload = "unexpected<script>"
+        tree = {
+            "root": "ROOT",
+            "nodes": [
+                {"id": "ROOT", "goal": "root", "status": payload, "leads_to": "N1"},
+                {"id": "N1", "goal": "child", "status": "confirmed", "leads_to": ""},
+            ],
+        }
+        out = gen_attack_tree(tree)
+        class_lines = [line for line in out.splitlines() if line.strip().startswith("class ")]
+        assert "unexpected<script>" not in "\n".join(class_lines)
+        assert any(line.strip() == "class ROOT unexplored" for line in class_lines)
+
+
 # ---------------------------------------------------------------------------
 # hypotheses tests
 # ---------------------------------------------------------------------------
@@ -512,6 +716,23 @@ class TestHypotheses:
         assert "\u2014" not in out
 
 
+    def test_subgraph_and_label_fields_are_sanitized(self):
+        payload = "F1; click F1 javascript:alert(1)"
+        label_payload = "X\"]\n    click X javascript:alert(1)\n    Y[\""
+        data = [{
+            "id": label_payload,
+            "finding": payload,
+            "status": label_payload,
+            "claim": label_payload,
+            "predictions": [
+                {"id": label_payload, "prediction": label_payload, "result": label_payload, "status": label_payload}
+            ],
+        }]
+        out = gen_hypotheses(data)
+        assert_no_mermaid_directive_injection(out)
+        assert "subgraph F1__click_F1_javascript_alert_1_" in out
+
+
 # ---------------------------------------------------------------------------
 # attack_paths tests
 # ---------------------------------------------------------------------------
@@ -543,6 +764,51 @@ class TestAttackPaths:
         assert "P0S1" in out
         assert "P0S2" in out
         assert "P0S1 --> P0S2" in out
+
+
+    def test_step_type_and_location_are_sanitized(self):
+        payload = "X\"]\n    click X javascript:alert(1)\n    Y[\""
+        out = generate_single({
+            "id": "PATH-X",
+            "name": payload,
+            "status": payload,
+            "steps": [
+                {
+                    "step": 1,
+                    "type": payload,
+                    "definition": payload,
+                    "description": payload,
+                    "tainted_var": payload,
+                }
+            ],
+        }, 0)
+        assert_no_mermaid_directive_injection(out)
+
+    def test_uppercase_step_type_preserves_escaped_entities(self):
+        out = generate_single({
+            "id": "PATH-X",
+            "name": "path",
+            "status": "confirmed",
+            "steps": [{"step": 1, "type": "<sink>", "definition": "src/db.py:50"}],
+        }, 0)
+        assert "&lt;SINK&gt;" in out
+        assert "&LT;" not in out
+        assert "&GT;" not in out
+
+    def test_sanitized_attack_path_is_still_usable_mermaid(self):
+        payload = "X\"]\n    click X javascript:alert(1)\n    Y[\""
+        out = generate_single({
+            "id": "PATH-X",
+            "name": payload,
+            "status": "confirmed",
+            "proximity": 8,
+            "steps": [
+                {"step": 1, "type": "entry", "definition": "src/routes.py:10", "description": payload},
+                {"step": 2, "type": "sink", "definition": "src/db.py:50", "description": "write"},
+            ],
+        }, 0)
+        assert_no_mermaid_directive_injection(out)
+        assert_usable_mermaid_flowchart(out)
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +869,28 @@ class TestRenderer:
         assert "Attack Paths" in out
         assert "Hypotheses" in out
         assert out.count("```mermaid") >= 5
+
+    def test_rendered_mermaid_blocks_have_usable_entrypoints(self, tmp_path):
+        self._make_out_dir(tmp_path, {
+            "context-map.json": CONTEXT_MAP_FULL,
+            "flow-trace-EP-001.json": FLOW_TRACE_DATA,
+            "attack-tree.json": ATTACK_TREE_DATA,
+            "attack-paths.json": ATTACK_PATHS_DATA,
+            "hypotheses.json": HYPOTHESES_DATA,
+            "findings.json": {
+                "findings": [
+                    {"ruling": {"status": "exploitable"}, "vuln_type": "buffer_overflow"},
+                    {"ruling": {"status": "confirmed"}, "vuln_type": "xss"},
+                ]
+            },
+        })
+        blocks = extract_mermaid_blocks(render_directory(tmp_path, target="full-run"))
+        assert blocks
+        assert all(
+            block.startswith(("flowchart TD", "flowchart LR", "pie title", "%%{init:"))
+            for block in blocks
+        )
+        assert all("\n```" not in block for block in blocks)
 
     def test_render_attack_tree_enriched_with_companions(self, tmp_path):
         disproven_wrapped = {"disproven": [{"finding": "N2", "why_wrong": "suppressed errors", "lesson": ""}]}
