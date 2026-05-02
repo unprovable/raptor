@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,7 @@ class TestSyscallNumberTable(unittest.TestCase):
     wrong syscall entirely (different op, possibly unsafe). The table
     in mount_ns.py is load-bearing."""
 
+    @unittest.skipUnless(sys.platform == "linux", "pivot_root is Linux-only")
     def test_host_arch_is_mapped(self):
         import platform
         from core.sandbox.mount_ns import _PIVOT_ROOT_SYSCALL_NR
@@ -68,6 +70,7 @@ class TestSyscallNumberTable(unittest.TestCase):
                       f"— will raise NotImplementedError at run time. "
                       f"Add it to core/sandbox/mount_ns.py.")
 
+    @unittest.skipUnless(sys.platform == "linux", "pivot_root is Linux-only")
     def test_lookup_helper(self):
         from core.sandbox.mount_ns import _pivot_root_nr
         nr = _pivot_root_nr()
