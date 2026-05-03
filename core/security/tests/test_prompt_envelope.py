@@ -251,7 +251,7 @@ def test_markdown_strip_off_keeps_markup():
         ),),
     )
     user = bundle.messages[1].content
-    assert "example.com" in user
+    assert "https://example.com/img.png" in user
 
 
 # --- Defence layers: datamarking ---
