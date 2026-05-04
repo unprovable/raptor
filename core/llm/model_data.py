@@ -213,7 +213,7 @@ def price_for(
     cost tracking, ``max_cost_usd`` enforcement) actually want.
 
     Unknown models return ``default`` rather than raising — the caller
-    chooses between (a) soft warn + treat as \$0 (cost tracking
+    chooses between (a) soft warn + treat as $0 (cost tracking
     degrades cleanly, ``max_cost_usd`` cap effectively disabled) and
     (b) hard error by passing ``default=None`` and checking — but
     ``None`` isn't a valid tuple so callers wanting hard errors should
