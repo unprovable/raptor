@@ -29,7 +29,7 @@ import typer
 from cve_diff.core.exceptions import CveDiffError
 from cve_diff.infra import api_status
 from cve_diff.infra.github_client import warn_if_token_missing
-from cve_diff.pipeline import Pipeline
+from cve_diff.pipeline import Pipeline, PipelineResult
 from cve_diff.report import osv_schema
 
 _PER_CVE_TIMEOUT_S = 300  # 5 min. Any upstream-slice clone finishes well under.
@@ -148,7 +148,7 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
                     extraction_agree=ext_agree.get("verdict") or "single_source",
                     **_agent_attrs(pipeline, model_id),
                 )
-                _write_flow(out, cve_id, r)
+                _write_flow(out, cve_id, r, pipeline=pipeline, pipeline_result=result)
                 # Save each extraction method's raw diff body as a
                 # `.patch` file so the partial/disagree cases are easy
                 # to audit. Best-effort; never blocks the bench.
@@ -182,7 +182,7 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
                     error_class=_classify_error(err),
                     **_agent_attrs(pipeline, model_id),
                 )
-                _write_flow(out, cve_id, r)
+                _write_flow(out, cve_id, r, pipeline=pipeline)
                 return r
             except CveDiffError as exc:
                 err = f"{type(exc).__name__}: {exc}"[:300]
@@ -194,7 +194,7 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
                     error_class=_classify_error(err),
                     **_agent_attrs(pipeline, model_id),
                 )
-                _write_flow(out, cve_id, r)
+                _write_flow(out, cve_id, r, pipeline=pipeline)
                 return r
             except Exception as exc:  # noqa: BLE001 — bench must not abort on one CVE
                 err = f"{type(exc).__name__}: {exc}"[:300]
@@ -206,7 +206,7 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
                     error_class=_classify_error(err),
                     **_agent_attrs(pipeline, model_id),
                 )
-                _write_flow(out, cve_id, r)
+                _write_flow(out, cve_id, r, pipeline=pipeline)
                 return r
     finally:
         signal.alarm(0)
@@ -260,10 +260,27 @@ def _write_failure_md(output_dir: Path, cve_id: str, error_class: str,
         pass
 
 
-def _write_flow(output_dir: Path, cve_id: str, result: "_CveResult") -> None:
+def _write_flow(output_dir: Path, cve_id: str, result: "_CveResult",
+                pipeline: "Pipeline | None" = None,
+                pipeline_result: "PipelineResult | None" = None) -> None:
     """Emit `<cve>.flow.jsonl` + `<cve>.flow.md` for one bench result.
-    Thin adapter over the shared `cve_diff.report.flow.write_flow_files`.
+
+    When ``pipeline`` is supplied, this delegates to
+    ``cve_diff.cli.main._flow_from_pipeline`` so the bench's per-CVE
+    flow.md gets the same stage_signals + stage_status that single-run
+    flow.md already has — without that plumbing, every stages 2-5 row
+    rendered "(not reached)" even on a successful PASS.
     """
+    if pipeline is not None:
+        from cve_diff.cli.main import _flow_from_pipeline
+        _flow_from_pipeline(
+            output_dir, cve_id, pipeline,
+            ok=result.ok,
+            error_class=result.error_class,
+            pipeline_result=pipeline_result,
+        )
+        return
+    # Fallback path: pipeline not available (e.g. raised before assignment).
     from cve_diff.report.flow import write_flow_files
     write_flow_files(
         output_dir, cve_id,
