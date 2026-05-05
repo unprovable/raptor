@@ -256,10 +256,36 @@ def _scan_settings(path: Path) -> Optional[FileScan]:
                     for entry in inner:
                         if not isinstance(entry, dict):
                             continue
-                        if entry.get("type") == "command":
+                        # Pre-fix: only `type == "command"` hooks were
+                        # flagged. CC's hook spec is small today (just
+                        # `command`), but a future addition (or a
+                        # caller-supplied custom hook type) would slip
+                        # past entirely — we'd silently treat
+                        # `type=plugin` / `type=script` / etc. as
+                        # benign. Fail-closed: any hook entry whose
+                        # type we don't recognise is treated as
+                        # dangerous (the value field is rendered for
+                        # operator review).
+                        hook_type = entry.get("type")
+                        if hook_type == "command":
                             cmd = entry.get("command")
                             value = _truncate(cmd) if isinstance(cmd, str) and cmd else "(empty)"
                             fs.findings.append(Finding(f"{ev} hook", value, True))
+                        else:
+                            # Unknown hook type — surface the type +
+                            # the entry's keys so the operator can
+                            # judge. Treated as blocking like every
+                            # other hook finding.
+                            type_label = _truncate(
+                                str(hook_type) if hook_type is not None else "(missing)",
+                                limit=40,
+                            )
+                            keys_summary = ",".join(sorted(entry.keys()))
+                            fs.findings.append(Finding(
+                                f"{ev} hook ({type_label}, unknown type)",
+                                _truncate(keys_summary),
+                                True,
+                            ))
 
         env_cfg = data.get("env")
         if isinstance(env_cfg, dict):
