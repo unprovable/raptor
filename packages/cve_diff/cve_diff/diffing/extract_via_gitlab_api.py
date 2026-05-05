@@ -42,13 +42,40 @@ _USER_AGENT = "cve-diff-gitlab/0.1"
 
 
 @functools.lru_cache(maxsize=1)
-def _client() -> UrllibClient:
-    return UrllibClient(user_agent=_USER_AGENT)
+def _client() -> "EgressClient":
+    """Allowlisted egress client (curated GitLab hosts only).
 
+    Pre-2026-05-04 this returned a bare UrllibClient with no host
+    allowlist. Combined with the very loose `_GITLAB_HOST_RE`
+    (``gitlab.<anything>``) that meant a CVE record citing
+    `gitlab.localhost` or `gitlab.evil.com` would fetch from those
+    hosts directly — SSRF amplifier. Now we share the same
+    `_AGENT_FORGE_HOSTS` allowlist the agent tool layer uses; every
+    GitLab host we care about is in it, anything else gets refused
+    at CONNECT.
+    """
+    from core.http.egress_backend import EgressClient
+    from cve_diff.agent.tools import _AGENT_FORGE_HOSTS
+    return EgressClient(allowed_hosts=_AGENT_FORGE_HOSTS, user_agent=_USER_AGENT)
+
+
+# Only accept hosts on the curated GitLab allowlist. The previous
+# `gitlab\.[^/]+` pattern matched any subdomain; combined with a
+# bare UrllibClient that allowed unconstrained outbound requests, a
+# CVE record citing `gitlab.localhost` / `gitlab.evil.com` would fetch.
+_GITLAB_ALLOWED_HOSTS = frozenset({
+    "gitlab.com",
+    "gitlab.freedesktop.org",
+    "gitlab.kde.org",
+    "gitlab.gnome.org",
+    "gitlab.kitware.com",
+    "gitlab.alpinelinux.org",
+    "gitlab.matrix.org",
+    "gitlab.suse.com",
+})
 
 _GITLAB_HOST_RE = re.compile(
-    r"^(https?://(?:gitlab\.com|gitlab\.[^/]+))/"
-    r"([^?#]+?)/?$",
+    r"^(https?://([\w.-]+))/([^?#]+?)/?$",
     re.IGNORECASE,
 )
 
@@ -65,8 +92,9 @@ def _gitlab_host_and_slug(repo_url: str) -> tuple[Optional[str], Optional[str]]:
     m = _GITLAB_HOST_RE.match(repo_url.strip())
     if not m:
         return None, None
-    host = m.group(1)
-    slug = m.group(2)
+    host, hostname, slug = m.group(1), m.group(2).lower(), m.group(3)
+    if hostname not in _GITLAB_ALLOWED_HOSTS:
+        return None, None
     if slug.endswith(".git"):
         slug = slug[:-4]
     return host, slug
