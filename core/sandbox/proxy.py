@@ -719,8 +719,13 @@ class EgressProxy:
             await self._write_error(writer, 400, "Bad Request")
             return
         host, _, port_str = target.rpartition(":")
-        # Strip IPv6 brackets if present: [::1]:443
-        host = host.strip("[]")
+        # Strip IPv6 brackets if present: [::1]:443.
+        # `str.strip("[]")` strips ANY leading/trailing `[` or `]`
+        # regardless of pairing, so `]example.com[` would also collapse
+        # to `example.com` — which doesn't match the IPv6-bracket
+        # intent. Only strip when both bookends are present together.
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
         try:
             port = int(port_str)
         except ValueError:
