@@ -478,11 +478,13 @@ class Pipeline:
         agent to pick a *different* candidate or surrender. Same
         retry-budget shape as `_maybe_retry` via `_focused_retry`.
         """
-        prior_verified: tuple[tuple[str, str], ...] = ()
-        if isinstance(prior_result, AgentSurrender):
-            prior_verified = prior_result.verified_candidates or ()
-        # AgentOutput doesn't carry verified_candidates today; if we
-        # ever extend it to do so, pull from there too.
+        # Both AgentOutput and AgentSurrender carry verified_candidates
+        # since 2026-05; the post-submit-retry path is reached when the
+        # agent submitted (AgentOutput) but stages 2-5 failed, so the
+        # prior_result is AgentOutput in this code path.
+        prior_verified: tuple[tuple[str, str], ...] = (
+            getattr(prior_result, "verified_candidates", ()) or ()
+        )
 
         candidates_str = (
             "\n".join(f"  - {slug} @ {sha[:12]}" for slug, sha in prior_verified[:5])
