@@ -84,7 +84,18 @@ def extract_envelope_metadata(envelope: dict, into: dict) -> None:
     if isinstance(duration_ms, (int, float)):
         into["duration_seconds"] = round(duration_ms / 1000, 1)
     model_usage = envelope.get("modelUsage", {})
-    into["analysed_by"] = next(iter(model_usage)) if model_usage else "claude-code"
+    if isinstance(model_usage, dict) and model_usage:
+        # Pre-fix `next(iter(model_usage))` picked one arbitrary key.
+        # CC envelopes list ALL models that contributed to the turn —
+        # a main reasoning model plus a smaller helper for tool-call
+        # routing, for example. Recording only the first hides the
+        # helper's contribution and silently misattributes cost
+        # tracking when multiple models are summed under one name.
+        # Sort for deterministic output (envelope dict ordering is
+        # CC's choice, may vary across CC versions).
+        into["analysed_by"] = ",".join(sorted(model_usage.keys()))
+    else:
+        into["analysed_by"] = "claude-code"
     usage = envelope.get("usage", {})
     in_tokens = usage.get("input_tokens", 0) or 0
     out_tokens = usage.get("output_tokens", 0) or 0
