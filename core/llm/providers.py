@@ -2078,7 +2078,20 @@ class ClaudeCodeLLMProvider(LLMProvider):
         # Per-call timeout: prefer explicit kwarg, then ModelConfig.timeout,
         # then a generous default (Claude Code subprocess + tool-use can
         # take several minutes on real workloads).
-        self._timeout_s = timeout_s or (config.timeout if config.timeout else 600)
+        #
+        # `0` is the documented "no timeout" sentinel — operator
+        # explicitly opting out of the cap (a long-running tool-use
+        # session, an unattended overnight scan). Pre-fix the
+        # `timeout_s or ...` chain treated 0 as falsy and overrode it
+        # with the 600s default — silently re-enforcing the cap the
+        # operator just disabled. Use explicit `is None` for kwarg
+        # absence and `<= 0` to honour the no-timeout sentinel.
+        if timeout_s is not None:
+            self._timeout_s = None if timeout_s <= 0 else timeout_s
+        elif config.timeout is not None:
+            self._timeout_s = None if config.timeout <= 0 else config.timeout
+        else:
+            self._timeout_s = 600
 
     def generate(
         self,
