@@ -106,6 +106,7 @@ def run_rule(
     json_output_path: Optional[Path] = None,
     semgrep_bin: Optional[str] = None,
     extra_args: Optional[List[str]] = None,
+    subprocess_runner=None,
 ) -> SemgrepResult:
     """Run semgrep with one config against a target.
 
@@ -121,6 +122,12 @@ def run_rule(
             temporary file is used and removed after parsing.
         semgrep_bin: Override semgrep binary path.
         extra_args: Additional semgrep arguments.
+        subprocess_runner: Optional callable replacing subprocess.run. Must
+            accept the same kwargs (capture_output, text, timeout, env)
+            and return an object with returncode/stdout/stderr. Defaults
+            to subprocess.run. Used by callers that need to engage a
+            sandbox (e.g. core.sandbox.run) without reimplementing the
+            semgrep invocation logic.
 
     Returns:
         SemgrepResult with parsed findings, files_examined, files_failed,
@@ -152,9 +159,11 @@ def run_rule(
         extra_args=extra_args,
     )
 
+    runner = subprocess_runner or subprocess.run
+
     start = time.monotonic()
     try:
-        proc = subprocess.run(
+        proc = runner(
             cmd,
             capture_output=True,
             text=True,
@@ -220,6 +229,7 @@ def run_rules(
     env: Optional[Dict[str, str]] = None,
     semgrep_bin: Optional[str] = None,
     extra_args: Optional[List[str]] = None,
+    subprocess_runner=None,
 ) -> List[SemgrepResult]:
     """Run multiple semgrep configurations sequentially.
 
@@ -260,6 +270,7 @@ def run_rules(
             env=env,
             semgrep_bin=semgrep_bin,
             extra_args=extra_args,
+            subprocess_runner=subprocess_runner,
         )
         results.append(result)
     return results
