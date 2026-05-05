@@ -30,18 +30,64 @@ Public API:
     if result.verdict == "confirmed":
         for ev in result.evidence:
             print(f"{ev.tool}: {ev.summary}")
+
+Optional structured fields on Hypothesis (source/sink/flow_steps/
+sanitizers/smt_constraints), evidence provenance (Evidence.refers_to +
+hash_hypothesis), the verdict ladder (verdict_from/aggregate), and the
+must_progress iteration guard are all additive — Phase A callers see
+no change.
 """
 
-from .hypothesis import Hypothesis
+from .hypothesis import (
+    Hypothesis,
+    Location,
+    SourceLocation,  # back-compat alias for Location
+    SinkLocation,    # back-compat alias for Location
+    FlowStep,
+)
 from .result import Evidence, ValidationResult
 from .adapters.base import ToolAdapter, ToolCapability, ToolInvocation, ToolEvidence
+from .verdict import verdict_from, aggregate
+from .provenance import (
+    HypothesisHash,
+    ProvenanceMismatch,
+    ensure_same_provenance,
+    hash_hypothesis,
+)
+from .iteration import IterationStep, IterationStalled, uncertainty, must_progress
+from .posterior import (
+    Posterior,
+    UNIFORM_PRIOR,
+    posterior_from,
+    update as posterior_update,
+    verdict_from_posterior,
+)
 
 __all__ = [
     "Hypothesis",
+    "Location",
+    "SourceLocation",
+    "SinkLocation",
+    "FlowStep",
     "ValidationResult",
     "Evidence",
     "ToolAdapter",
     "ToolCapability",
     "ToolInvocation",
     "ToolEvidence",
+    "verdict_from",
+    "aggregate",
+    "HypothesisHash",
+    "ProvenanceMismatch",
+    "hash_hypothesis",
+    "ensure_same_provenance",
+    "IterationStep",
+    "IterationStalled",
+    "uncertainty",
+    "must_progress",
+    "Posterior",
+    "UNIFORM_PRIOR",
+    "posterior_from",
+    "posterior_update",
+    "verdict_from_posterior",
 ]
