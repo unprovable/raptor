@@ -119,8 +119,21 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
     """
     t0 = time.monotonic()
     out = Path(output_dir)
-    prev_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(_PER_CVE_TIMEOUT_S)
+    # SIGALRM only delivers to the main thread; if we install it in the
+    # parent process (workers <= 1 path), and the agent / DistroFetcher
+    # spins up its own ThreadPoolExecutor, SIGALRM can fire from inside
+    # an unrelated `as_completed` loop while a worker thread is the one
+    # actually stuck — the worker thread + its subprocess get orphaned.
+    # Install the alarm only when we're in a ProcessPoolExecutor child
+    # (its own process, separate signal disposition); the sequential
+    # path relies on per-subprocess timeouts (RaptorConfig.GIT_CLONE_TIMEOUT
+    # + httpx.timeout) for runaway protection.
+    import multiprocessing
+    install_alarm = multiprocessing.current_process().name != "MainProcess"
+    prev_handler = None
+    if install_alarm:
+        prev_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(_PER_CVE_TIMEOUT_S)
     # Bench enables both consensus (pointer-level) and extraction
     # agreement (content-level) — the user's primary integrity signals.
     # Cost is near-zero because OSV / NVD / GitHub-commit fetches share
@@ -209,8 +222,10 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
                 _write_flow(out, cve_id, r, pipeline=pipeline)
                 return r
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, prev_handler)
+        if install_alarm:
+            signal.alarm(0)
+            if prev_handler is not None:
+                signal.signal(signal.SIGALRM, prev_handler)
 
 
 def _agent_attrs(pipeline: "Pipeline", model_id: str) -> dict:
