@@ -138,14 +138,25 @@ class PromptBundle:
 # the model sees that *something* was here and can flag it.
 _AUTOFETCH_MARKUP_RE = re.compile(
     r'!\[[^\]]*\]\([^)]+\)'
-    r'|\[[^\]]*\]\((?:https?|ht%74ps?|data|javascript|file|ftp):[^)]+\)'
+    # Markdown link with auto-fetching scheme. `vbscript:` is the IE-era
+    # equivalent of `javascript:` and still parses in some renderers.
+    # `//host/path` (scheme-relative) inherits the page scheme — at-risk
+    # in any context where the rendered output flows back to a browser.
+    r'|\[[^\]]*\]\((?:https?|ht%74ps?|data|javascript|vbscript|file|ftp)?:[^)]+\)'
+    r'|\[[^\]]*\]\(//[^)]+\)'
     r'|<(?:img|iframe|object|embed|video|audio|source|link|script|base|form|use)\b[^>]*>'
     r'|<a\s[^>]*>'
     r'|<svg\b[^>]*>'
     r'|<meta\b[^>]*>'
+    # `<style>` with body OR a self-contained tag. The original pattern
+    # required `</style>`, so a malformed `<style>...` (no close tag) or
+    # a self-closing variant slipped through. `\b[^>]*>` matches either,
+    # the body+close path is kept as a separate alternative for the
+    # @import-inside-style case.
     r'|<style\b[^>]*>.*?</style>'
+    r'|<style\b[^>]*>'
     r'|@import\s+url\([^)]*\)'
-    r'|\[[^\]]+\]:\s*(?:https?|data|javascript|file|ftp):[^\s]+'
+    r'|\[[^\]]+\]:\s*(?:https?|data|javascript|vbscript|file|ftp):[^\s]+'
     r'|data:[a-zA-Z0-9+./;-]+,[^\s)]*',
     re.IGNORECASE | re.DOTALL,
 )
