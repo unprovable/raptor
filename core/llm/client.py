@@ -634,7 +634,17 @@ class LLMClient:
                 return LLMResponse(
                     content=cached_content,
                     model=model_config.model_name,
-                    provider=model_config.provider,
+                    # Lowercase to match the provider field that fresh
+                    # `provider.generate()` returns. Pre-fix the cached
+                    # path passed `model_config.provider` verbatim, so
+                    # an LLMConfig with `provider="Anthropic"` (capital
+                    # A — accepted by the constructor since the
+                    # downstream lookup is case-insensitive) returned
+                    # `"Anthropic"` from cached calls and `"anthropic"`
+                    # from fresh ones. Downstream consumers grouping by
+                    # provider (telemetry summaries, cost rollups) split
+                    # the two into separate buckets silently.
+                    provider=model_config.provider.lower(),
                     tokens_used=0,
                     cost=0.0,
                     finish_reason="cached",
