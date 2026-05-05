@@ -235,6 +235,20 @@ def _build_openai_compat_config(provider_name: str) -> Optional['ModelConfig']:
     api_key = os.getenv(env_var_map[provider_name])
     if not api_key:
         return None
+    # All three providers route through OpenAICompatibleProvider
+    # downstream — without the openai SDK installed, that path
+    # crashes at provider construction. Skip the builder up-front so
+    # the resolver falls through to the next candidate (Ollama,
+    # ClaudeCode) instead of detecting a usable API key, advertising
+    # the model to the operator, then crashing the next LLM call.
+    from .detection import OPENAI_SDK_AVAILABLE
+    if not OPENAI_SDK_AVAILABLE:
+        logger.debug(
+            "Skipping %s config: %s key present but openai SDK not "
+            "installed (pip install openai)",
+            provider_name, env_var_map[provider_name],
+        )
+        return None
     default_model = PROVIDER_DEFAULT_MODELS[provider_name]
     limits = MODEL_LIMITS.get(default_model, {})
     costs = MODEL_COSTS.get(default_model, {})
