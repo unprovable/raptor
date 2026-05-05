@@ -149,11 +149,15 @@ def extract_via_patch_url(cve_id: str, ref: RepoRef) -> DiffBundle | None:
         return None
     if resp.status != 200:
         return None
-    body = resp.body.decode("utf-8", errors="replace")
+    # Cap on raw bytes (not codepoints). The previous `len(body) >
+    # _MAX_BYTES` ran AFTER UTF-8 decode, so a 5M-codepoint string of
+    # mostly-multibyte chars could be 15-20 MB of underlying bytes;
+    # the in-memory body is also held in full before the cap. Cap
+    # bytes-side first.
+    raw = resp.body[:_MAX_BYTES]
+    body = raw.decode("utf-8", errors="replace")
     if not body or not body.strip():
         return None
-    if len(body) > _MAX_BYTES:
-        body = body[:_MAX_BYTES]
 
     parsed = _parse_unified_diff(body)
     if not parsed:
