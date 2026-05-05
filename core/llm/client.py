@@ -291,14 +291,23 @@ class LLMClient:
             )
 
     def _get_provider(self, model_config: ModelConfig) -> LLMProvider:
-        """Get or create provider for model config."""
+        """Get or create provider for model config.
+
+        Thread-safe: the check-then-create pattern is wrapped under
+        `_stats_lock` (already RLock) so concurrent calls with the
+        same model can't both pass the membership check and end up
+        constructing two provider instances — the earlier one would
+        be silently leaked when the later write replaces it.
+        Provider construction is cheap (no network) so holding the
+        lock across `create_provider` is fine.
+        """
         key = f"{model_config.provider}:{model_config.model_name}"
 
-        if key not in self.providers:
-            logger.debug(f"Creating provider: {key}")
-            self.providers[key] = create_provider(model_config)
-
-        return self.providers[key]
+        with self._stats_lock:
+            if key not in self.providers:
+                logger.debug(f"Creating provider: {key}")
+                self.providers[key] = create_provider(model_config)
+            return self.providers[key]
 
     @property
     def primary_provider(self) -> LLMProvider:
