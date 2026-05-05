@@ -63,6 +63,9 @@ Trust = Literal["trusted", "untrusted"]
 MessageRole = Literal["system", "user", "assistant"]
 
 
+_VALID_TRUST_VALUES: frozenset[str] = frozenset({"trusted", "untrusted"})
+
+
 @dataclass(frozen=True)
 class TaintedString:
     """A string with an explicit trust label.
@@ -71,10 +74,26 @@ class TaintedString:
     untrusted value as trusted prose. Untrusted slot values are still
     rendered into the prompt, but inside the envelope's named-slot
     structure, never as free text.
+
+    The `Trust` Literal annotation is type-check time only and Python
+    doesn't enforce it at runtime — `__post_init__` validates that
+    `trust` is exactly one of `{"trusted", "untrusted"}`. Without this
+    runtime check, `TaintedString(value="x", trust="UNTRUSTED")` (case
+    drift), `trust="maybe"`, or `trust=None` all construct fine and
+    then silently bypass the `== "trusted"` routing in `_render_slots`
+    — defaulting to the untrusted-rendering path is the safer
+    failure mode but the operator wouldn't see the typo.
     """
 
     value: str
     trust: Trust
+
+    def __post_init__(self) -> None:
+        if self.trust not in _VALID_TRUST_VALUES:
+            raise ValueError(
+                f"TaintedString.trust must be one of "
+                f"{sorted(_VALID_TRUST_VALUES)!r}; got {self.trust!r}"
+            )
 
 
 @dataclass(frozen=True)
