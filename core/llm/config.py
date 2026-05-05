@@ -367,8 +367,18 @@ def _get_default_primary_model(
     # explicit choice beats env-var defaults — if they configured
     # Gemini in ``~/.config/raptor/models.json``, respect that even
     # when OPENAI_API_KEY happens to be set as an env var.
+    #
+    # When `prefer` is set, the cached thinking model is only honoured
+    # if its provider matches the preference list — otherwise we'd
+    # return e.g. an OpenAI thinking model to a consumer that
+    # explicitly preferred Anthropic, defeating the prefer arg's
+    # entire purpose. The docstring above promises this; pre-fix the
+    # check was missing and the cached-thinking-model path silently
+    # ignored `prefer`.
     thinking_model = _get_best_thinking_model()
-    if thinking_model and thinking_model.api_key:
+    if (thinking_model
+            and thinking_model.api_key
+            and (prefer_set is None or thinking_model.provider in prefer_set)):
         logger.info(
             f"Using automatic thinking model: "
             f"{thinking_model.provider}/{thinking_model.model_name}"
