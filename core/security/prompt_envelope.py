@@ -316,7 +316,22 @@ def _content_for_envelope(content: str, profile: ModelDefenseProfile) -> str:
 
 
 def _xml_attr_escape(s: str) -> str:
-    return escape_nonprintable(s).replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;')
+    # Escape the full XML attribute-special set: `&` `<` `>` `"` `'`.
+    # Pre-fix `>` and `'` were unescaped — fine for strict XML parsers
+    # which only require `<` / `&` / quote-of-the-attr-delim, but our
+    # consumers are LLMs that pattern-match visually rather than
+    # parsing XML. An attribute value containing `>` (closing the
+    # attribute's tag visually) or `'` (closing a single-quoted
+    # surrounding attr in a future change) was a smuggling primitive.
+    # Escape both for defence-in-depth.
+    return (
+        escape_nonprintable(s)
+        .replace('&', '&amp;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+        .replace('"', '&quot;')
+        .replace("'", '&apos;')
+    )
 
 
 def _xml_content_escape(s: str) -> str:
