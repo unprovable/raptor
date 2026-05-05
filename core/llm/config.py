@@ -575,15 +575,22 @@ def resolve_model_roles(
     Raises:
         ConfigError on invalid role configurations.
     """
+    # All three branches below return the same 6-key shape so callers
+    # can iterate the dict without per-branch missing-key handling.
+    # Pre-fix the empty-config branch missed `analysis_models` and
+    # `judge_models`, and the no-roles default branch missed
+    # `analysis_models` — consumers calling
+    # `roles["analysis_models"]` crashed with KeyError if the empty
+    # or no-roles branch produced the dict.
     if primary_model is None and not fallback_models:
         return {
             "analysis_model": None,
             "analysis_models": [],
             "code_model": None,
             "consensus_models": [],
-            "fallback_models": [],
             "judge_models": [],
             "aggregate_models": [],
+            "fallback_models": [],
         }
 
     all_models = []
@@ -597,10 +604,11 @@ def resolve_model_roles(
 
     if not has_roles:
         # Default: first model = analysis + code, rest = fallback
+        first = all_models[0] if all_models else None
         return {
-            "analysis_model": all_models[0] if all_models else None,
-            "analysis_models": [all_models[0]] if all_models else [],
-            "code_model": all_models[0] if all_models else None,
+            "analysis_model": first,
+            "analysis_models": [first] if first is not None else [],
+            "code_model": first,
             "consensus_models": [],
             "judge_models": [],
             "aggregate_models": [],
