@@ -189,7 +189,18 @@ class Pipeline:
                 return self._acquire_to_render(
                     cve_id, ref, agent_result, work_dir
                 )
-            except (AcquisitionError, AnalysisError, IdenticalCommitsError) as exc:
+            # Also catch ValueError from commit_resolver (rev-parse failure
+            # on stale SHA) and RuntimeError from transient mid-fetch git
+            # errors — both are recoverable by re-running the agent with
+            # a different candidate, so they belong in the post-submit
+            # retry path rather than being a hard pipeline crash.
+            except (
+                AcquisitionError,
+                AnalysisError,
+                IdenticalCommitsError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
                 if attempt == _MAX_POST_SUBMIT_RETRIES:
                     raise
                 self._emit("post_submit_retry", "start", {
