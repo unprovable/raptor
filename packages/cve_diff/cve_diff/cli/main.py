@@ -277,6 +277,18 @@ def run(
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_ctx: tempfile.TemporaryDirectory | None = None
     if work_dir is None:
+        if keep_workdir:
+            # `--keep-workdir` without `--work-dir` is meaningless: even if
+            # we suppress tmp_ctx.cleanup(), TemporaryDirectory's GC
+            # finalizer deletes the dir on collection. Refuse so the user
+            # gets a clear error rather than the silent "kept dir vanished
+            # anyway" surprise.
+            typer.echo(
+                "--keep-workdir requires --work-dir; the default temp "
+                "directory is auto-deleted regardless of this flag.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         tmp_ctx = tempfile.TemporaryDirectory(prefix="cve-diff-")
         work = Path(tmp_ctx.name)
     else:
