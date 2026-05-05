@@ -182,6 +182,16 @@ def _try_auto_migrate(old_config: Path, new_config: Path) -> bool:
     import json
     from .model_data import PROVIDER_ENV_KEYS
 
+    # Allowlist of providers RAPTOR's downstream code can handle.
+    # LiteLLM supports a much wider set (vertex_ai, bedrock, sagemaker,
+    # cohere, replicate, etc.) — migrating those produces JSON
+    # entries that our config loader silently ignores at best, or
+    # crashes on at worst. Skip with a debug log so the operator can
+    # see what was dropped and add a manual entry if needed.
+    _SUPPORTED_PROVIDERS = frozenset({
+        "anthropic", "openai", "gemini", "mistral", "ollama", "claudecode",
+    })
+
     try:
         with open(old_config) as f:
             data = yaml.safe_load(f)
@@ -190,6 +200,7 @@ def _try_auto_migrate(old_config: Path, new_config: Path) -> bool:
             return False
 
         models = []
+        skipped_unknown: list[str] = []
         for entry in data['model_list']:
             if not isinstance(entry, dict):
                 continue
@@ -201,6 +212,14 @@ def _try_auto_migrate(old_config: Path, new_config: Path) -> bool:
 
             provider = underlying.split('/')[0]
             model_name = underlying.split('/', 1)[1]
+
+            if provider not in _SUPPORTED_PROVIDERS:
+                # Drop the entry rather than write an unsupported
+                # provider into the migrated config. The loader would
+                # later silently skip it (best case) or crash on a
+                # missing builder (worst case).
+                skipped_unknown.append(f"{provider}/{model_name}")
+                continue
 
             model_entry = {"provider": provider, "model": model_name}
 
@@ -223,6 +242,16 @@ def _try_auto_migrate(old_config: Path, new_config: Path) -> bool:
 
         if not models:
             return False
+
+        if skipped_unknown:
+            logger.info(
+                "Auto-migration skipped %d unsupported provider(s): %s. "
+                "RAPTOR supports: %s. Add a manual entry to %s if needed.",
+                len(skipped_unknown),
+                ", ".join(skipped_unknown),
+                ", ".join(sorted(_SUPPORTED_PROVIDERS)),
+                new_config,
+            )
 
         # Write new config with restrictive permissions atomically
         from core.json import save_json
