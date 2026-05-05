@@ -94,12 +94,12 @@ class TestCoccinelleAdapter:
         from packages.coccinelle.models import SpatchResult
         captured = {}
 
-        def fake_run_rule(*, target, rule, timeout, env):
+        def fake_run_rule(*, target, rule, timeout, env, subprocess_runner=None):
             captured["rule_path"] = rule
             captured["rule_text"] = rule.read_text()
             return SpatchResult(rule="r", returncode=0)
 
-        a = CoccinelleAdapter()
+        a = CoccinelleAdapter(sandbox=False)
         with patch.object(a, "is_available", return_value=True), \
              patch("packages.coccinelle.run_rule", side_effect=fake_run_rule):
             a.run("MY UNIQUE RULE TEXT", tmp_path)
@@ -176,12 +176,12 @@ class TestSemgrepAdapter:
         from packages.semgrep.models import SemgrepResult
         captured = {}
 
-        def fake_run_rule(*, target, config, timeout, env):
+        def fake_run_rule(*, target, config, timeout, env, subprocess_runner=None):
             captured["config"] = config
             captured["rule_text"] = Path(config).read_text()
             return SemgrepResult(name="r", returncode=0)
 
-        a = SemgrepAdapter()
+        a = SemgrepAdapter(sandbox=False)
         with patch.object(a, "is_available", return_value=True), \
              patch("packages.semgrep.run_rule", side_effect=fake_run_rule):
             a.run("UNIQUE_YAML_TEXT_FOR_TEST", tmp_path)

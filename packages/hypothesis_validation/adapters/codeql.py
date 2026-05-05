@@ -25,7 +25,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional
 
-from .base import ToolAdapter, ToolCapability, ToolEvidence
+from .base import ToolAdapter, ToolCapability, ToolEvidence, make_sandbox_runner
 
 
 _SYNTAX_EXAMPLE = """\
@@ -64,15 +64,22 @@ class CodeQLAdapter(ToolAdapter):
             Required at run() time; if None at construction, the adapter
             is_available() returns False until set_database() is called.
         codeql_bin: Override CodeQL CLI path. Defaults to PATH lookup.
+        sandbox: When True (default), run codeql in a network-blocked
+            sandbox via core.sandbox.run. Falls back gracefully to
+            subprocess.run when the sandbox isn't available on the host.
+            Set False for tests or trusted environments.
     """
 
     def __init__(
         self,
         database_path: Optional[Path] = None,
         codeql_bin: Optional[str] = None,
+        *,
+        sandbox: bool = True,
     ):
         self._database_path = Path(database_path) if database_path else None
         self._codeql_bin = codeql_bin or shutil.which("codeql")
+        self._sandbox = sandbox
 
     @property
     def name(self) -> str:
@@ -117,7 +124,7 @@ class CodeQLAdapter(ToolAdapter):
         rule: str,
         target: Path,
         *,
-        timeout: int = 1800,
+        timeout: int = 300,
         env: Optional[Dict[str, str]] = None,
     ) -> ToolEvidence:
         """Run an LLM-generated .ql query against the configured database.
@@ -126,6 +133,11 @@ class CodeQLAdapter(ToolAdapter):
         queries the database (set at construction or via set_database).
         Callers should pass target=database_path or target=source_root
         for audit-trail clarity.
+
+        timeout defaults to 300s. Heavy queries can opt into a longer
+        wall-clock by passing timeout= explicitly. The previous default
+        (1800s) created DoS exposure: a malformed LLM-generated query
+        could stall a single hypothesis for 30 minutes.
         """
         if not self._codeql_bin:
             return ToolEvidence(
@@ -146,6 +158,10 @@ class CodeQLAdapter(ToolAdapter):
             return ToolEvidence(
                 tool=self.name, rule=rule, success=False, error="empty rule",
             )
+
+        if env is None:
+            from core.config import RaptorConfig
+            env = RaptorConfig.get_safe_env()
 
         # codeql wants the .ql in a query pack alongside a qlpack.yml.
         # Generate both in a temp dir.
@@ -169,8 +185,12 @@ class CodeQLAdapter(ToolAdapter):
                     f"--output={sarif_path}",
                     "--no-rerun",
                 ]
+                runner = (
+                    make_sandbox_runner(target=self._database_path)
+                    if self._sandbox else subprocess.run
+                )
                 try:
-                    proc = subprocess.run(
+                    proc = runner(
                         cmd, capture_output=True, text=True,
                         timeout=timeout, env=env,
                     )

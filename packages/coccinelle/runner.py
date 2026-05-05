@@ -56,6 +56,7 @@ def run_rule(
     timeout: int = 300,
     env: Optional[Dict[str, str]] = None,
     defines: Optional[Dict[str, str]] = None,
+    subprocess_runner=None,
 ) -> SpatchResult:
     """Run a single Coccinelle rule against a target.
 
@@ -67,6 +68,12 @@ def run_rule(
         timeout: Per-rule timeout in seconds.
         env: Subprocess environment (use get_safe_env() for untrusted targets).
         defines: Virtual identifier bindings passed as -D key=value.
+        subprocess_runner: Optional callable replacing subprocess.run. Must
+            accept the same kwargs (capture_output, text, timeout, env,
+            input) and return an object with returncode/stdout/stderr.
+            Defaults to subprocess.run. Used by callers that need to
+            engage a sandbox (e.g. core.sandbox.run) without reimplementing
+            the spatch invocation logic.
 
     Returns:
         SpatchResult with matches parsed from COCCIRESULT lines.
@@ -117,10 +124,11 @@ def run_rule(
             cmd.extend(["-D", f"{k}={v}"])
 
     run_env = dict(env) if env is not None else RaptorConfig.get_safe_env()
+    runner = subprocess_runner or subprocess.run
 
     start = time.monotonic()
     try:
-        proc = subprocess.run(
+        proc = runner(
             cmd,
             capture_output=True,
             text=True,
@@ -169,6 +177,7 @@ def run_rules(
     timeout_per_rule: int = 300,
     env: Optional[Dict[str, str]] = None,
     defines: Optional[Dict[str, str]] = None,
+    subprocess_runner=None,
 ) -> List[SpatchResult]:
     """Run all .cocci rules in a directory against a target.
 
@@ -200,6 +209,7 @@ def run_rules(
             timeout=timeout_per_rule,
             env=env,
             defines=defines,
+            subprocess_runner=subprocess_runner,
         )
         results.append(result)
 

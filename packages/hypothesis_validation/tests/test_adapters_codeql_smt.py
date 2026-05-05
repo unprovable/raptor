@@ -80,19 +80,23 @@ class TestCodeQLAdapterRun:
     def _adapter(self, tmp_path):
         db = tmp_path / "db"
         db.mkdir()
-        return CodeQLAdapter(database_path=db, codeql_bin="/usr/bin/codeql"), db
+        # sandbox=False so subprocess.run mocks work directly
+        a = CodeQLAdapter(
+            database_path=db, codeql_bin="/usr/bin/codeql", sandbox=False,
+        )
+        return a, db
 
     def test_run_no_binary(self, tmp_path):
         db = tmp_path / "db"
         db.mkdir()
         with patch("shutil.which", return_value=None):
-            a = CodeQLAdapter(database_path=db)
+            a = CodeQLAdapter(database_path=db, sandbox=False)
         ev = a.run("import cpp\nselect 1\n", tmp_path)
         assert not ev.success
         assert "not installed" in ev.error
 
     def test_run_no_database(self, tmp_path):
-        a = CodeQLAdapter(codeql_bin="/usr/bin/codeql")
+        a = CodeQLAdapter(codeql_bin="/usr/bin/codeql", sandbox=False)
         ev = a.run("import cpp\nselect 1\n", tmp_path)
         assert not ev.success
         assert "no CodeQL database" in ev.error
@@ -101,6 +105,7 @@ class TestCodeQLAdapterRun:
         a = CodeQLAdapter(
             database_path=tmp_path / "nonexistent",
             codeql_bin="/usr/bin/codeql",
+            sandbox=False,
         )
         ev = a.run("import cpp\nselect 1\n", tmp_path)
         assert not ev.success

@@ -4,12 +4,19 @@ The runner depends only on this interface. Adapters wrap concrete tools
 (Coccinelle, Semgrep, CodeQL, SMT) and expose a uniform run-a-rule
 operation plus a self-describing capability summary the runner uses to
 build the LLM prompt.
+
+Sandboxing: by default, all subprocess-based adapters (Coccinelle,
+Semgrep, CodeQL) engage core.sandbox.run with block_network=True so an
+LLM-generated rule cannot exfiltrate data over the network. Callers
+that need to disable the sandbox (tests, trusted environments where
+performance dominates) construct adapters with sandbox=False. The SMT
+adapter is sandbox-free because it never spawns a subprocess.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -125,6 +132,60 @@ class ToolEvidence:
             "summary": self.summary,
             "error": self.error,
         }
+
+
+def make_sandbox_runner(
+    *,
+    target: Path,
+    output: Optional[Path] = None,
+    block_network: bool = True,
+    caller_label: str = "hypothesis-validation",
+) -> Callable:
+    """Build a subprocess-runner-shaped callable that wraps core.sandbox.run.
+
+    The returned callable has the same signature as subprocess.run for the
+    kwargs the runners actually use (capture_output, text, timeout, env,
+    input). Suitable to pass as `subprocess_runner=` to
+    packages/coccinelle and packages/semgrep run_rule.
+
+    Falls back to subprocess.run when core.sandbox is unavailable
+    (non-Linux/macOS hosts) — the underlying runners still get the safe
+    env from the adapter's run() method, so this is degrade-not-fail.
+
+    Args:
+        target: Scan target path. Used by the sandbox to set Landlock
+            read access; LLM-generated rule scans the target only.
+        output: Optional output dir for Landlock writable scope. When
+            None, the sandbox restricts writes to /tmp only.
+        block_network: True (default) blocks all network access. None of
+            our four tools need network for hypothesis validation —
+            registry packs are pre-resolved, queries run locally.
+        caller_label: Tag for sandbox event logs.
+
+    Returns:
+        Callable usable as subprocess_runner.
+    """
+    import subprocess
+
+    try:
+        from core.sandbox import run as sandbox_run  # type: ignore
+    except Exception:
+        # Sandbox unavailable on this platform / install. Fall back to
+        # subprocess.run; the safe env from the adapter still applies.
+        return subprocess.run
+
+    def _runner(cmd, **kwargs):
+        sandbox_kwargs = {
+            "block_network": block_network,
+            "target": str(target),
+            "caller_label": caller_label,
+        }
+        if output is not None:
+            sandbox_kwargs["output"] = str(output)
+        sandbox_kwargs.update({k: v for k, v in kwargs.items() if k != "shell"})
+        return sandbox_run(cmd, **sandbox_kwargs)
+
+    return _runner
 
 
 class ToolAdapter(ABC):

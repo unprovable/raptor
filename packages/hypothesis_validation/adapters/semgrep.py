@@ -12,7 +12,7 @@ from typing import Dict, Optional
 
 from packages import semgrep as semgrep_pkg
 
-from .base import ToolAdapter, ToolCapability, ToolEvidence
+from .base import ToolAdapter, ToolCapability, ToolEvidence, make_sandbox_runner
 
 
 _SYNTAX_EXAMPLE = """\
@@ -32,7 +32,17 @@ rules:
 
 
 class SemgrepAdapter(ToolAdapter):
-    """Adapter wrapping packages/semgrep/ for hypothesis validation."""
+    """Adapter wrapping packages/semgrep/ for hypothesis validation.
+
+    Args:
+        sandbox: When True (default), run semgrep in a network-blocked
+            sandbox via core.sandbox.run. Falls back gracefully to
+            subprocess.run when the sandbox isn't available on the host.
+            Set False for tests or trusted environments.
+    """
+
+    def __init__(self, *, sandbox: bool = True):
+        self._sandbox = sandbox
 
     @property
     def name(self) -> str:
@@ -81,6 +91,10 @@ class SemgrepAdapter(ToolAdapter):
                 error="empty rule",
             )
 
+        if env is None:
+            from core.config import RaptorConfig
+            env = RaptorConfig.get_safe_env()
+
         rule_file: Optional[Path] = None
         try:
             tmp = NamedTemporaryFile(
@@ -91,11 +105,15 @@ class SemgrepAdapter(ToolAdapter):
             tmp.close()
             rule_file = Path(tmp.name)
 
+            subprocess_runner = (
+                make_sandbox_runner(target=target) if self._sandbox else None
+            )
             result = semgrep_pkg.run_rule(
                 target=target,
                 config=str(rule_file),
                 timeout=timeout,
                 env=env,
+                subprocess_runner=subprocess_runner,
             )
         except OSError as e:
             return ToolEvidence(
