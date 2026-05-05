@@ -134,13 +134,30 @@ def _check_litellm_installed() -> bool:
                     f"\n"
                 )
                 if installed == "1.82.8":
+                    # Removal must scope to Python's actual site-packages
+                    # locations rather than `find / -path '*/litellm*'`
+                    # which would:
+                    #   * traverse the whole filesystem on multi-mount /
+                    #     NFS hosts (hours; hits /proc/*, /sys/*),
+                    #   * delete unrelated files whose path happens to
+                    #     contain "litellm" (logs, research papers,
+                    #     symlinks, /tmp scratch dirs).
+                    # Narrow to the known Python site dirs from `python
+                    # -c "import site; print(site.getsitepackages(),
+                    # site.getusersitepackages())"`. The for-loop
+                    # iterates each one and only touches files literally
+                    # under `<sitedir>/litellm*` and the matching .pth.
                     msg += (
                         f"  Version 1.82.8 runs on ANY Python startup via a .pth file.\n"
                         f"  Do NOT use pip to remove it — pip invokes Python, triggering the payload.\n"
                         f"\n"
-                        f"  Safe removal (no Python invoked):\n"
-                        f"    find / -path '*/litellm*' -name '*.pth' -delete 2>/dev/null\n"
-                        f"    find / -path '*/site-packages/litellm*' -exec rm -rf {{}} + 2>/dev/null\n"
+                        f"  1. Identify your Python site-packages locations:\n"
+                        f"     python -c 'import site; print(*site.getsitepackages(), site.getusersitepackages())'\n"
+                        f"\n"
+                        f"  2. For EACH location printed above, remove the litellm package + .pth shim:\n"
+                        f"     SITE=/exact/path/from/step/1\n"
+                        f"     rm -rf \"$SITE\"/litellm \"$SITE\"/litellm-*.dist-info\n"
+                        f"     find \"$SITE\" -maxdepth 1 -name 'litellm*.pth' -delete\n"
                         f"\n"
                         f"  Then rotate all API keys, SSH keys, and cloud credentials.\n"
                     )
