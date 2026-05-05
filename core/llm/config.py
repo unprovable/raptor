@@ -266,16 +266,30 @@ def _build_ollama_config() -> Optional['ModelConfig']:
         if selected_model != ollama_models[0]:
             break
     ollama_base = _validate_ollama_url(RaptorConfig.OLLAMA_HOST)
-    if selected_model not in MODEL_LIMITS:
+    # Look up the actual limits when known. Pre-fix the log claimed
+    # "using defaults (max_context=32000, max_output=4096)" but the
+    # construction only passed `max_tokens=4096` and let max_context
+    # fall through to ModelConfig's class default — known models
+    # never benefited from MODEL_LIMITS and got the same defaults
+    # as unknown ones. Now: known → use the registered limits;
+    # unknown → keep the historical 32000/4096 defaults but log it.
+    limits = MODEL_LIMITS.get(selected_model)
+    if limits is None:
         logger.info(
             f"Model '{selected_model}' not in MODEL_LIMITS — using defaults "
             f"(max_context=32000, max_output=4096). Override in models.json if needed."
         )
+        max_output = 4096
+        max_context = 32000
+    else:
+        max_output = limits.get("max_output", 4096)
+        max_context = limits.get("max_context", 32000)
     return ModelConfig(
         provider="ollama",
         model_name=selected_model,
         api_base=f"{ollama_base}/v1",
-        max_tokens=4096,
+        max_tokens=max_output,
+        max_context=max_context,
         temperature=0.7,
         cost_per_1k_tokens=0.0,
     )
