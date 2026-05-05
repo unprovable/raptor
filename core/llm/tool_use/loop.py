@@ -126,6 +126,18 @@ class ToolUseLoop:
                 f"ToolUseLoop terminal_tool {terminal_tool!r} is not in the "
                 "registered tools; loop would never terminate via that path"
             )
+        if not isinstance(max_iterations, int) or max_iterations < 1:
+            # Reject 0 (loop terminates before any work is done — looks
+            # like a "max iterations hit" outcome but actually no LLM
+            # call was made; misleading) and negative (loop would never
+            # hit the cap — the comparison `iterations > max_iterations`
+            # is always False for non-negative iters when max_iter is
+            # negative, producing an infinite loop bounded only by the
+            # cost / token / wall-clock caps if those happen to be set).
+            raise ValueError(
+                f"ToolUseLoop max_iterations must be a positive int; "
+                f"got {max_iterations!r}"
+            )
 
         self._system = system
         self._terminal_tool = terminal_tool
