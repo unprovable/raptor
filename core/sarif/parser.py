@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from core.config import RaptorConfig
 from core.json import load_json
+from core.logging import get_logger
+
+logger = get_logger()
 
 
 def _path_from_locations(
@@ -95,7 +98,7 @@ def extract_dataflow_path(code_flows: List[Dict[str, Any]]) -> Optional[Dict[str
         return primary
 
     except Exception as e:
-        print(f"[SARIF Parser] Warning: Failed to extract dataflow path: {e}")
+        logger.warning(f"SARIF parser: failed to extract dataflow path: {e}")
         return None
 
 
@@ -336,7 +339,7 @@ def load_sarif(sarif_path: Path) -> Optional[Dict[str, Any]]:
         Parsed SARIF dict, or None on error
     """
     if not sarif_path.exists():
-        print(f"[SARIF] ERROR: File does not exist: {sarif_path}")
+        logger.error(f"SARIF: file does not exist: {sarif_path}")
         return None
 
     max_size = 100 * 1024 * 1024  # 100 MiB
@@ -345,23 +348,23 @@ def load_sarif(sarif_path: Path) -> Optional[Dict[str, Any]]:
         # Read then check size — avoids TOCTOU between stat() and read()
         content = sarif_path.read_text()
         if len(content) > max_size:
-            print(f"[SARIF] ERROR: File too large ({len(content) / 1024 / 1024:.0f} MiB): {sarif_path}")
+            logger.error(f"SARIF: file too large ({len(content) / 1024 / 1024:.0f} MiB): {sarif_path}")
             return None
     except OSError as e:
-        print(f"[SARIF] WARNING: Could not read {sarif_path}: {e}")
+        logger.warning(f"SARIF: could not read {sarif_path}: {e}")
         return None
 
     try:
         data = json.loads(content or "{}")
     except json.JSONDecodeError as e:
-        print(f"[SARIF] ERROR: Invalid JSON in {sarif_path}: {e}")
+        logger.error(f"SARIF: invalid JSON in {sarif_path}: {e}")
         return None
     except OSError as e:
-        print(f"[SARIF] ERROR: Could not read {sarif_path}: {e}")
+        logger.error(f"SARIF: could not read {sarif_path}: {e}")
         return None
 
     if not isinstance(data, dict):
-        print(f"[SARIF] ERROR: Root must be an object in {sarif_path}")
+        logger.error(f"SARIF: root must be an object in {sarif_path}")
         return None
 
     return data
@@ -398,11 +401,11 @@ def parse_sarif_findings(sarif_path: Path) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
 
     runs = data.get("runs") or []
-    print(f"[SARIF Parser] Found {len(runs)} run(s) in SARIF file")
+    logger.info(f"SARIF parser: found {len(runs)} run(s) in SARIF file")
     
     for run_idx, run in enumerate(runs):
         results = run.get("results", [])
-        print(f"[SARIF Parser] Run {run_idx + 1}: {len(results)} result(s)")
+        logger.info(f"SARIF parser: run {run_idx + 1}: {len(results)} result(s)")
 
         tool_name = get_tool_name(run)
 
@@ -475,7 +478,7 @@ def parse_sarif_findings(sarif_path: Path) -> List[Dict[str, Any]]:
                 }
             )
 
-    print(f"[SARIF Parser] Parsed {len(findings)} total findings")
+    logger.info(f"SARIF parser: parsed {len(findings)} total findings")
     return findings
 
 
@@ -495,11 +498,13 @@ def validate_sarif(sarif_path: Path, schema_path: Optional[Path] = None) -> bool
         return False
 
     if sarif_data.get("version") not in ["2.1.0", "2.0.0"]:
-        print(f"[validation] Unsupported SARIF version: {sarif_data.get('version')}")
+        logger.warning(
+            f"SARIF validation: unsupported version: {sarif_data.get('version')}"
+        )
         return False
 
     if "runs" not in sarif_data:
-        print("[validation] SARIF missing required 'runs' field")
+        logger.warning("SARIF validation: missing required 'runs' field")
         return False
 
     # Optional: Full schema validation if jsonschema is available
@@ -520,7 +525,7 @@ def validate_sarif(sarif_path: Path, schema_path: Optional[Path] = None) -> bool
         # jsonschema not installed - skip full validation
         pass
     except jsonschema.ValidationError as e:
-        print(f"[validation] SARIF schema validation failed: {e.message}")
+        logger.warning(f"SARIF validation: schema validation failed: {e.message}")
         return False
 
     return True
