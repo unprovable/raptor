@@ -447,16 +447,32 @@ def orchestrate(
     _probe_failed = False
     if dispatch_fn and _models_to_probe:
         from core.security.envelope_probe import probe_envelope_compatibility
-        profile = get_profile_for(analysis_model_name)
+        # Per-model profile collection. Pre-fix the outer `profile`
+        # was set ONCE to the primary's profile and used unchanged
+        # for all models; with `--analysis-models claude-opus,gpt-4`
+        # the GPT-4 dispatches received an ANTHROPIC_CLAUDE-shaped
+        # envelope (different `tag_style`, different defence
+        # layers GPT-4 isn't validated against). Collect each
+        # probed profile and intersect at the end so AnalysisTask
+        # uses the common ground all models passed.
+        _probed_profiles: list = []
         for _probe_model in _models_to_probe:
             _pname = _probe_model.model_name if hasattr(_probe_model, "model_name") else str(_probe_model)
+            _pprofile = get_profile_for(_pname)
             probe_result = probe_envelope_compatibility(
-                _probe_model, get_profile_for(_pname), dispatch_fn,
+                _probe_model, _pprofile, dispatch_fn,
             )
             defense_telemetry.set_probe_result(_pname, probe_result.compatible)
             if not probe_result.compatible:
                 _probe_failed = True
                 break
+            _probed_profiles.append(_pprofile)
+        # Intersect profiles for multi-model — AND every boolean
+        # so any model that lacks a defence layer disables it
+        # globally, matching the comment's "strictest COMPATIBLE
+        # profile" semantics.
+        if not _probe_failed and _probed_profiles:
+            profile = _intersect_profiles(_probed_profiles)
         if _probe_failed:
             if not accept_weakened_defenses:
                 print(f"\n  Envelope probe failed for {model_label}: {probe_result.error}")
@@ -896,6 +912,39 @@ def orchestrate(
     print(f"  Report: {out_path}")
 
     return merged
+
+
+def _intersect_profiles(profiles: list) -> Any:
+    """Return a defence profile compatible with every input profile.
+
+    AND-together each boolean field — if ANY input has a layer
+    disabled, the result also disables it. Tag style: keep the
+    common one when all match; otherwise fall back to nonce-only
+    (the safe baseline that every probed profile inherits via
+    CONSERVATIVE). Single-input list short-circuits to the input.
+
+    Used by orchestrate() so multi-model runs apply the defences
+    common to all probed models, rather than the primary's
+    defences applied uniformly to every dispatcher.
+    """
+    from core.security.prompt_envelope import ModelDefenseProfile
+    if not profiles:
+        return CONSERVATIVE
+    if len(profiles) == 1:
+        return profiles[0]
+    base = profiles[0]
+    tag_styles = {p.tag_style for p in profiles}
+    role_placements = {p.role_placement for p in profiles}
+    return ModelDefenseProfile(
+        name="multi-" + "+".join(sorted({p.name for p in profiles})),
+        tag_style=base.tag_style if len(tag_styles) == 1 else "nonce-only",
+        envelope_xml=all(p.envelope_xml for p in profiles),
+        datamarking=all(p.datamarking for p in profiles),
+        base64_code=all(p.base64_code for p in profiles),
+        slot_discipline=all(p.slot_discipline for p in profiles),
+        markdown_strip=all(p.markdown_strip for p in profiles),
+        role_placement=base.role_placement if len(role_placements) == 1 else "user-only",
+    )
 
 
 def _resolve_cross_family_checker(
