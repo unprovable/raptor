@@ -163,8 +163,13 @@ def _run_understand_prepass_unsafe(
         # second time. Falls back to a fresh build if the agentic checklist
         # isn't present (e.g. when build_inventory failed earlier).
         if not _provision_understand_checklist(target, agentic_out_dir, understand_dir):
-            _fail_lifecycle(understand_dir, "checklist build failed")
+            # Mark settled BEFORE the call so that if _fail_lifecycle
+            # itself raises, the `finally` block's "interrupted"
+            # fallback doesn't overwrite the real failure reason.
+            # Same pattern at every other _fail_lifecycle call site
+            # in this function.
             lifecycle_settled = True
+            _fail_lifecycle(understand_dir, "checklist build failed")
             return PrepassResult(ran=False, skipped_reason="checklist build failed",
                                  understand_dir=understand_dir,
                                  duration_s=time.time() - t0)
@@ -190,23 +195,23 @@ def _run_understand_prepass_unsafe(
                 caller_label="agentic-understand",
             )
         except subprocess.TimeoutExpired:
-            _fail_lifecycle(understand_dir, f"timeout after {_PREPASS_TIMEOUT_S}s")
             lifecycle_settled = True
+            _fail_lifecycle(understand_dir, f"timeout after {_PREPASS_TIMEOUT_S}s")
             logger.warning("understand pre-pass timed out after %ds", _PREPASS_TIMEOUT_S)
             return PrepassResult(ran=False, skipped_reason=f"timeout after {_PREPASS_TIMEOUT_S}s",
                                  understand_dir=understand_dir,
                                  duration_s=time.time() - t0)
         except OSError as e:
-            _fail_lifecycle(understand_dir, f"launch failed: {e}")
             lifecycle_settled = True
+            _fail_lifecycle(understand_dir, f"launch failed: {e}")
             logger.warning("understand pre-pass failed to launch: %s", e)
             return PrepassResult(ran=False, skipped_reason=f"launch failed: {e}",
                                  understand_dir=understand_dir,
                                  duration_s=time.time() - t0)
 
         if proc.returncode != 0:
-            _fail_lifecycle(understand_dir, f"subprocess returned {proc.returncode}")
             lifecycle_settled = True
+            _fail_lifecycle(understand_dir, f"subprocess returned {proc.returncode}")
             logger.warning("understand pre-pass returned %d", proc.returncode)
             return PrepassResult(ran=False, skipped_reason=f"subprocess returned {proc.returncode}",
                                  understand_dir=understand_dir,
@@ -214,8 +219,8 @@ def _run_understand_prepass_unsafe(
 
         context_map = understand_dir / "context-map.json"
         if not context_map.exists():
-            _fail_lifecycle(understand_dir, "context-map.json missing after run")
             lifecycle_settled = True
+            _fail_lifecycle(understand_dir, "context-map.json missing after run")
             logger.warning("understand pre-pass completed but context-map.json was not written")
             return PrepassResult(ran=False, skipped_reason="context-map.json missing after run",
                                  understand_dir=understand_dir,
@@ -230,8 +235,8 @@ def _run_understand_prepass_unsafe(
         parsed = load_json(context_map)
         shape_error = _validate_context_map_shape(parsed)
         if shape_error is not None:
-            _fail_lifecycle(understand_dir, f"context-map.json invalid: {shape_error}")
             lifecycle_settled = True
+            _fail_lifecycle(understand_dir, f"context-map.json invalid: {shape_error}")
             logger.warning("understand pre-pass: context-map.json failed shape check (%s)",
                            shape_error)
             return PrepassResult(ran=False, skipped_reason=f"context-map.json invalid: {shape_error}",
@@ -258,8 +263,8 @@ def _run_understand_prepass_unsafe(
 
     except Exception:
         # Make sure the lifecycle is marked failed before propagating.
-        _fail_lifecycle(understand_dir, "unexpected exception")
         lifecycle_settled = True
+        _fail_lifecycle(understand_dir, "unexpected exception")
         raise
     finally:
         # KeyboardInterrupt / SystemExit / any other BaseException bypasses
