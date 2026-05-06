@@ -741,11 +741,41 @@ class RetryTask(AnalysisTask):
             except (ValueError, TypeError):
                 score = None
 
-            was_contradictory = prior_results.get(fid, {}).get("self_contradictory")
+            prior = prior_results.get(fid, {})
+            was_contradictory = prior.get("self_contradictory")
             decisive = score is not None and not (self.LOW <= score <= self.HIGH)
 
             if was_contradictory or decisive:
-                prior_results[fid] = r
+                # Merge instead of replace. Pre-fix this was
+                # `prior_results[fid] = r` which wholesale
+                # discarded every annotation earlier pipeline
+                # stages had attached: `_nonce_leaked` (defense
+                # telemetry), `_quality` (response validation),
+                # `cross_family_check` (CrossFamilyCheckTask
+                # verdict + checker_model + trigger),
+                # `contradictions` (self-consistency check
+                # output). Downstream consumers (judge,
+                # consensus, reporting) lost the audit trail
+                # for any finding that hit the retry loop.
+                # Take the new analysis content as the base and
+                # graft back annotation keys (underscore-prefix
+                # convention + the named cross-pipeline ones).
+                merged = dict(r)
+                _ANNOTATION_KEYS = {
+                    "cross_family_check", "contradictions",
+                    "self_contradictory",
+                }
+                for k, v in prior.items():
+                    if k.startswith("_") or k in _ANNOTATION_KEYS:
+                        # Don't let new result override an
+                        # annotation if both happen to set it;
+                        # underscore keys are pipeline-internal
+                        # state, the prior write is authoritative.
+                        if k not in merged:
+                            merged[k] = v
+                        elif k.startswith("_"):
+                            merged[k] = v  # pipeline state — prior wins.
+                prior_results[fid] = merged
             prior_results[fid]["retried"] = True
             if not was_contradictory and not decisive:
                 prior_results[fid]["low_confidence"] = True
