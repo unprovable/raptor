@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -265,6 +266,13 @@ def _create_default_file(path: Path) -> None:
 
 _cached: Optional[Tuning] = None
 _cached_stat: Optional[tuple] = None  # (st_mtime_ns, st_size)
+# Lock around the cache check + update. Pre-fix `get_tuning` was
+# racy: two threads calling it concurrently could both see
+# `_cached is None`, both call `load_tuning()` (file I/O + JSON
+# parse), both write to the cache. Worse, the WINNING write could
+# be the older one if the threads interleaved between the assigns.
+# Holding the lock briefly serialises check-then-update.
+_cached_lock = threading.Lock()
 
 
 def _file_stat(path: Path) -> Optional[tuple]:
@@ -276,13 +284,22 @@ def _file_stat(path: Path) -> Optional[tuple]:
 
 
 def get_tuning() -> Tuning:
-    """Return tuning values, re-reading only when the file changes."""
+    """Return tuning values, re-reading only when the file changes.
+
+    Thread-safe via `_cached_lock`. Pre-fix the check-then-update
+    sequence was racy across threads — two callers could both
+    observe `_cached is None`, both issue a file read + JSON parse,
+    both write to the cache. The winning write was order-dependent
+    and could be older than the loser. Hold the lock briefly to
+    serialise.
+    """
     global _cached, _cached_stat
     current = _file_stat(_TUNING_PATH)
-    if _cached is None or current != _cached_stat:
-        _cached = load_tuning()
-        _cached_stat = current
-    return _cached
+    with _cached_lock:
+        if _cached is None or current != _cached_stat:
+            _cached = load_tuning()
+            _cached_stat = current
+        return _cached
 
 
 __all__ = ["Tuning", "get_tuning", "load_tuning"]
