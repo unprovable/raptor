@@ -31,6 +31,30 @@ def correlate_results(results_by_id: Dict[str, Dict]) -> Dict[str, Any]:
         if not analyses or len(analyses) < 2:
             continue
 
+        # Recompute on stale verdicts. `multi_model_analyses`
+        # captures each model's verdict at INITIAL DISPATCH time;
+        # later pipeline stages (RetryTask, ConsensusTask,
+        # CrossFamilyCheckTask) update the top-level
+        # `result["is_exploitable"]` / `ruling` /
+        # `exploitability_score` for the primary model BUT do NOT
+        # update the corresponding `multi_model_analyses` entry.
+        # Without this normalisation step the correlation matrix
+        # showed stale per-model verdicts for the active model
+        # (and downstream "disputed" / "high" labels were
+        # computed against pre-retry data), so a finding the
+        # retry stage successfully reconciled would still show
+        # as disputed in the operator's report.
+        active_model = result.get("analysed_by")
+        for a in analyses:
+            if a.get("model") and a.get("model") == active_model:
+                # Pull the post-pipeline values into the
+                # multi_model_analyses entry. Only overwrite
+                # fields where the top-level result has a value
+                # (don't clobber per-model reasoning with None).
+                for key in ("is_exploitable", "exploitability_score", "ruling"):
+                    if key in result:
+                        a[key] = result[key]
+
         per_model = {}
         for a in analyses:
             model = a.get("model", "?")
