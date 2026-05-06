@@ -199,8 +199,28 @@ class JsonCache:
             return MISSING
         # Caller may downgrade TTL relative to what was stored. Honour
         # the *minimum* TTL.
-        effective_ttl = ttl_seconds if ttl_seconds < envelope.ttl_seconds \
-            or envelope.ttl_seconds == TTL_FOREVER else envelope.ttl_seconds
+        #
+        # `TTL_FOREVER = -1` is a sentinel for "infinite", NOT a tiny
+        # negative TTL. Pre-fix the comparison `ttl_seconds <
+        # envelope.ttl_seconds` treated -1 as smaller than any finite
+        # TTL — so a caller passing `TTL_FOREVER` against a stored
+        # 60s entry got `effective_ttl = -1` (FOREVER), silently
+        # extending the entry's lifetime past its actual expiry.
+        # Operators saw stale data persist indefinitely after they
+        # started passing FOREVER for a hot key.
+        #
+        # Correct minimum-with-sentinel logic:
+        #   * Both FOREVER → FOREVER.
+        #   * One FOREVER, other finite → finite (it IS the minimum).
+        #   * Both finite → arithmetic min.
+        if ttl_seconds == TTL_FOREVER and envelope.ttl_seconds == TTL_FOREVER:
+            effective_ttl = TTL_FOREVER
+        elif ttl_seconds == TTL_FOREVER:
+            effective_ttl = envelope.ttl_seconds
+        elif envelope.ttl_seconds == TTL_FOREVER:
+            effective_ttl = ttl_seconds
+        else:
+            effective_ttl = min(ttl_seconds, envelope.ttl_seconds)
         envelope = CacheEnvelope(
             written_at=envelope.written_at,
             ttl_seconds=effective_ttl,
