@@ -82,6 +82,18 @@ def main():
     if not file_path:
         return
 
+    # Reject paths with NUL or line-terminator characters. The
+    # manifest is line-delimited, so a `file_path` containing `\n`
+    # (a hostile hook payload, or a rare-but-legal filesystem entry
+    # name on platforms that allow newlines) splits into multiple
+    # manifest entries — downstream parsers see fictitious paths.
+    # NUL gets truncated by various C-level readers (the kernel,
+    # some Python file APIs in 3.13+) producing a different path
+    # than what the hook reported. Reject either up-front rather
+    # than corrupting the manifest.
+    if "\x00" in file_path or "\n" in file_path or "\r" in file_path:
+        return
+
     # Skip non-source files
     dot = file_path.rfind(".")
     if dot == -1 or file_path[dot:].lower() not in _SOURCE_EXTENSIONS:
@@ -98,9 +110,18 @@ def main():
         except (OSError, ValueError):
             return
 
-    # Append to manifest
+    # Append to manifest with O_NOFOLLOW. Pre-fix `open(..., "a")`
+    # followed any symlink at the manifest path — if an attacker
+    # (or a careless test fixture) planted a symlink at
+    # `<run_dir>/<MANIFEST_NAME>` pointing elsewhere, our writes
+    # went to the symlink target. ELOOP from the kernel when the
+    # path is a symlink → fall through to the OSError except and
+    # silently skip.
     try:
-        with open(os.path.join(run_dir, MANIFEST_NAME), "a") as f:
+        manifest_path = os.path.join(run_dir, MANIFEST_NAME)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(manifest_path, flags, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(file_path + "\n")
     except OSError:
         pass
