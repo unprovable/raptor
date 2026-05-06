@@ -250,10 +250,40 @@ class TestLegacyQuirksPreserved:
         # Legacy: `if r_expl` is truthy for "yes", 1, [...], etc.
         # Substrate's strict ``is True`` check would have rejected
         # them. Preserve legacy's truthy behaviour.
+        # batch 346 — quality floor takes precedence over verdict
+        # rank, so the truthy-positive needs above-floor quality
+        # to actually win the selection.
         adapter = FindingAdapter()
-        r1 = {"is_exploitable": False, "_quality": 1.0, "analysed_by": "m1"}
-        r2 = {"is_exploitable": "yes", "_quality": 0.0, "analysed_by": "m2"}
-        # Legacy: r2 ranks positive (truthy), beats r1 (False).
+        r1 = {"is_exploitable": False, "_quality": 0.9, "analysed_by": "m1"}
+        r2 = {"is_exploitable": "yes", "_quality": 0.5, "analysed_by": "m2"}
+        # Both above floor (0.3); r2 ranks positive (truthy) and
+        # wins on the verdict axis.
+        assert adapter.select_primary([r1, r2])["analysed_by"] == "m2"
+
+    def test_quality_floor_demotes_low_quality_positive(self):
+        # batch 346 — a positive verdict with quality below the
+        # floor (0.3) should NOT outrank a clean above-floor
+        # negative. Pre-fix the malformed positive won; post-fix
+        # the clean negative wins.
+        adapter = FindingAdapter()
+        clean_negative = {
+            "is_exploitable": False, "_quality": 0.9, "analysed_by": "clean",
+        }
+        malformed_positive = {
+            "is_exploitable": True, "_quality": 0.05, "analysed_by": "malformed",
+        }
+        assert adapter.select_primary(
+            [malformed_positive, clean_negative]
+        )["analysed_by"] == "clean"
+
+    def test_quality_floor_only_candidate_still_wins(self):
+        # If every candidate is below floor, the best one
+        # (highest verdict-rank, then quality) is still selected
+        # — the floor is a preference, not a hard exclusion.
+        adapter = FindingAdapter()
+        r1 = {"is_exploitable": False, "_quality": 0.1, "analysed_by": "m1"}
+        r2 = {"is_exploitable": True, "_quality": 0.2, "analysed_by": "m2"}
+        # Both below floor; verdict rank decides — r2 wins.
         assert adapter.select_primary([r1, r2])["analysed_by"] == "m2"
 
     def test_bool_quality_treated_as_default(self):

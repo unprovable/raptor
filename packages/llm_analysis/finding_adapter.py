@@ -88,40 +88,65 @@ class FindingAdapter(BaseVerdictAdapter):
             return self.select_primary(non_error)
         return dict(model_results[0])
 
+    # Quality floor for primary selection. Results from
+    # response_validation with quality < floor are heavily
+    # malformed (missing required fields, partial responses,
+    # truncated mid-JSON). Promoting one to primary just because
+    # its truthy-positive `is_exploitable` outranks a clean
+    # negative is exactly the failure mode that surfaced in the
+    # bug-hunt review: low-quality positive verdicts are usually
+    # the LLM hallucinating or partially answering, not a real
+    # signal. 0.3 picked to match the LOW threshold elsewhere in
+    # the pipeline (RetryTask.LOW = 0.3 — same "definitely
+    # ambiguous" boundary).
+    _PRIMARY_QUALITY_FLOOR = 0.3
+
     def select_primary(
         self, model_results: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Mirror ``_select_primary_result`` behaviour exactly.
+        """Mirror ``_select_primary_result`` behaviour with a
+        quality floor on primary promotion.
 
-        Two legacy quirks the substrate's default ``select_primary``
-        does NOT preserve, so we override:
+        Selection key (lexicographic):
 
-        1. ``_quality`` defaults to 1.0 when missing (legacy treated
-           "no quality field" as "perfect quality"). Substrate's default
-           treats missing as 0.0 (no info). Effect: when one model has
-           ``_quality=0.85`` and another lacks the field, legacy picks
-           the one without it (1.0 > 0.85); substrate picks the 0.85.
-        2. ``is_exploitable`` is truthy-checked, not strictly compared
-           to True. Truthy non-bool values (``"yes"``, ``1``) rank as
-           positive in legacy. (Already covered by normalize_verdict.)
+        1. **Above-floor flag.** Results with `_quality >=
+           PRIMARY_QUALITY_FLOOR` rank ABOVE results below it,
+           regardless of their verdict. Pre-fix a positive
+           verdict with quality=0.05 (mostly-empty malformed
+           response) won over a clean negative — exactly the
+           wrong direction. Post-fix the clean negative wins;
+           the malformed positive falls to the bottom of the
+           pile but is still selectable if it's the only one
+           (preserves "always return *something*").
+        2. Verdict rank — positive (truthy is_exploitable)
+           ranks above negative.
+        3. -quality (higher quality wins ties).
+        4. -score (higher exploitability_score wins remaining ties).
 
-        These divergences are theoretical for clean LLM output, but we
-        preserve them to keep PR3 Option A a strict lift-and-shift.
+        Two legacy quirks preserved from `_select_primary_result`:
+        - `_quality` defaults to 1.0 when missing (legacy treated
+          "no quality field" as "perfect quality").
+        - `is_exploitable` is truthy-checked (covered by
+          normalize_verdict).
         """
         if not model_results:
             raise ValueError("select_primary called with empty list")
 
         def sort_key(r: Dict[str, Any]):
-            # Verdict rank via normalize_verdict so the adapter's
-            # verdict semantics live in one place. positive→0, anything
-            # else→1 (mirrors legacy's truthy check via normalize_verdict).
-            verdict_rank = 0 if self.normalize_verdict(r) == "positive" else 1
             # _quality defaults to 1.0 (legacy quirk)
             q_raw = r.get("_quality", 1.0)
             quality = q_raw if isinstance(q_raw, (int, float)) and not isinstance(q_raw, bool) else 0.0
+            # Above-floor flag — primary axis. 0 = above floor
+            # (preferred), 1 = below floor (last resort).
+            below_floor = 0 if quality >= self._PRIMARY_QUALITY_FLOOR else 1
+            # Verdict rank via normalize_verdict so the adapter's
+            # verdict semantics live in one place. positive→0,
+            # anything else→1 (mirrors legacy's truthy check via
+            # normalize_verdict).
+            verdict_rank = 0 if self.normalize_verdict(r) == "positive" else 1
             # exploitability_score: legacy uses ``r.get("...", 0) or 0``
             # so None or 0 both fall back to 0.
             score = r.get("exploitability_score", 0) or 0
-            return (verdict_rank, -quality, -score)
+            return (below_floor, verdict_rank, -quality, -score)
 
         return dict(sorted(model_results, key=sort_key)[0])
