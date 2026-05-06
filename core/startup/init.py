@@ -230,8 +230,19 @@ def _test_key(provider: str, api_key: str, api_base: str = None) -> bool:
     timeout = 3
     try:
         if provider == "gemini":
+            # Use `x-goog-api-key` header rather than `?key=...` query
+            # parameter. Both are documented; the header form keeps the
+            # key out of any logs that capture URLs:
+            #   * Gemini's server-side access logs.
+            #   * Any HTTPS proxy in the path that captures CONNECT
+            #     URLs (uncommon but seen on corporate gateways).
+            #   * Downstream debugging tools (curl --trace, requests'
+            #     hooks, anything that re-renders the request line).
+            # The TLS encryption protects the bytes in transit; the
+            # logging exposure is at endpoints.
             r = requests.get(
-                f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                headers={"x-goog-api-key": api_key},
                 timeout=timeout,
             )
             return r.status_code == 200
