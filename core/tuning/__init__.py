@@ -11,6 +11,7 @@ never blocks a session.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,14 +44,19 @@ _DEFAULTS = {
 }
 
 
-def _detect_ram_mb() -> int:
-    """25% of system RAM, clamped to [2048, 16384] MB."""
+def _detect_total_ram_mb() -> int:
+    """Return total system RAM in MB, or a conservative fallback."""
     try:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
-        total_mb = pages * page_size // (1024 * 1024)
     except (ValueError, OSError):
-        return 8192
+        return 32768
+    return pages * page_size // (1024 * 1024)
+
+
+def _detect_ram_mb() -> int:
+    """25% of system RAM, clamped to [2048, 16384] MB."""
+    total_mb = _detect_total_ram_mb()
     return max(2048, min(total_mb // 4, 16384))
 
 
@@ -60,9 +66,95 @@ def _detect_threads() -> int:
     return 0
 
 
+def _detect_semgrep_workers() -> int:
+    """Resolve a conservative CPU-based Semgrep worker count.
+
+    Semgrep scans are CPU and memory heavy, so the auto value should
+    improve utilisation on larger machines without defaulting to every
+    detected core.
+    """
+    return _detect_half_cpu_parallelism()
+
+
+def _detect_codeql_workers() -> int:
+    """Resolve a conservative parallel CodeQL database-build count."""
+    per_worker_ram_mb = _detect_ram_mb()
+    ram_limited_workers = max(1, _detect_total_ram_mb() // per_worker_ram_mb)
+    return _detect_half_cpu_parallelism(max_workers=min(8, ram_limited_workers))
+
+
+def _detect_fuzz_parallel() -> int:
+    """Resolve a conservative AFL++ parallel-instance ceiling."""
+    return _detect_half_cpu_parallelism()
+
+
+def _detect_cgroup_cpu_quota() -> int | None:
+    """Return an integer CPU quota from Linux cgroups, if configured."""
+    cpu_max = Path("/sys/fs/cgroup/cpu.max")
+    try:
+        quota_text = cpu_max.read_text(encoding="utf-8").strip().split()
+    except OSError:
+        quota_text = []
+    if len(quota_text) >= 2 and quota_text[0] != "max":
+        try:
+            quota = int(quota_text[0])
+            period = int(quota_text[1])
+        except ValueError:
+            quota = period = 0
+        if quota > 0 and period > 0:
+            return max(1, math.ceil(quota / period))
+
+    quota_path = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    period_path = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    try:
+        quota = int(quota_path.read_text(encoding="utf-8").strip())
+        period = int(period_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if quota > 0 and period > 0:
+        return max(1, math.ceil(quota / period))
+    return None
+
+
+def _detect_available_cpus() -> int:
+    """Return CPUs available to this process, respecting affinity/cgroups."""
+    candidates: list[int] = []
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        try:
+            affinity_cpus = len(sched_getaffinity(0))
+        except OSError:
+            affinity_cpus = 0
+        if affinity_cpus > 0:
+            candidates.append(affinity_cpus)
+
+    cpu_count = os.cpu_count()
+    if cpu_count is not None and cpu_count > 0:
+        candidates.append(cpu_count)
+
+    cgroup_cpus = _detect_cgroup_cpu_quota()
+    if cgroup_cpus is not None:
+        candidates.append(cgroup_cpus)
+
+    if not candidates:
+        return 4
+    return min(candidates)
+
+
+def _detect_half_cpu_parallelism(max_workers: int | None = None) -> int:
+    cpus = _detect_available_cpus()
+    workers = max(1, cpus // 2)
+    if max_workers is not None:
+        workers = min(workers, max_workers)
+    return workers
+
+
 _AUTO_RESOLVERS = {
     "codeql_ram_mb": _detect_ram_mb,
     "codeql_threads": _detect_threads,
+    "max_semgrep_workers": _detect_semgrep_workers,
+    "max_codeql_workers": _detect_codeql_workers,
+    "max_fuzz_parallel": _detect_fuzz_parallel,
 }
 
 # Keys where 0 is a valid explicit value (e.g. CodeQL's "0 = all CPUs")
@@ -150,10 +242,10 @@ def _create_default_file(path: Path) -> None:
         comments = {
             "codeql_ram_mb": "MB of RAM for CodeQL analysis",
             "codeql_threads": "CPUs for CodeQL (0 = all available)",
-            "max_semgrep_workers": "parallel Semgrep scans",
-            "max_codeql_workers": "parallel CodeQL database builds",
+            "max_semgrep_workers": "parallel Semgrep scans (auto = half available CPUs)",
+            "max_codeql_workers": "parallel CodeQL DB builds (auto = half available CPUs, capped)",
             "max_agentic_parallel": "parallel Claude Code agents for analysis",
-            "max_fuzz_parallel": "ceiling for AFL++ parallel instances",
+            "max_fuzz_parallel": "ceiling for AFL++ parallel instances (auto = half available CPUs)",
         }
         keys = list(_DEFAULTS.keys())
         entries = []
