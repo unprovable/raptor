@@ -2,7 +2,8 @@
   "env": {
     "CLAUDE_ENV_FILE": ".claude/raptor.env",
     "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1",
-    "BASH_DEFAULT_TIMEOUT_MS": "300000"
+    "BASH_DEFAULT_TIMEOUT_MS": "300000",
+    "CLAUDECODE": "1"
   },
   "permissions": {
     "allow": [
