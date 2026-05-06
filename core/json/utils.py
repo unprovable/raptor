@@ -60,10 +60,18 @@ def _strip_json_comments(text: str) -> str:
     Handles full-line comments, inline trailing comments, and comment
     characters inside quoted strings (e.g. ``"url": "https://x.com"``
     or ``"color": "#fff"``).
+
+    `in_string` state persists across line boundaries. Pre-fix the
+    state was reset per line, so a multi-line string (legal in JSON5
+    via `\\\\\\n` line continuations and accepted by tolerant parsers
+    like simdjson; common in human-edited config) lost track of the
+    in-string context at line breaks. A `//` or `#` inside the
+    spanning string was then incorrectly treated as a comment start
+    and the rest of that line was stripped — corrupting the value.
     """
     result = []
+    in_string = False  # persists across lines
     for line in text.split('\n'):
-        in_string = False
         i = 0
         while i < len(line):
             ch = line[i]
