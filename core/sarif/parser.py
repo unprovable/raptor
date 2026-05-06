@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from core.config import RaptorConfig
 from core.json import load_json
 from core.logging import get_logger
+from core.security.log_sanitisation import escape_nonprintable
 
 logger = get_logger()
 
@@ -38,13 +39,25 @@ def _path_from_locations(
         physical_loc = location.get("physicalLocation", {})
         artifact = physical_loc.get("artifactLocation", {})
         region = physical_loc.get("region", {})
-        message = location.get("message", {}).get("text", "")
+        # Untrusted scanner-supplied text — escape control / format
+        # bytes before surfacing into the operator-facing dataflow
+        # path. A scanner producing `message.text = "evil\x1b[2J"`
+        # (clear-screen ANSI escape, terminal hijack on stdout
+        # render) or a code snippet containing C1 controls / bidi
+        # overrides could otherwise smuggle terminal-rendering
+        # behaviour through the dataflow display layer.
+        message = escape_nonprintable(
+            location.get("message", {}).get("text", "") or ""
+        )
+        snippet = escape_nonprintable(
+            region.get("snippet", {}).get("text", "") or ""
+        )
         step_info = {
             "file": artifact.get("uri", ""),
             "line": region.get("startLine", 0),
             "column": region.get("startColumn", 0),
             "label": message,
-            "snippet": region.get("snippet", {}).get("text", ""),
+            "snippet": snippet,
         }
         if idx == 0:
             path["source"] = step_info
