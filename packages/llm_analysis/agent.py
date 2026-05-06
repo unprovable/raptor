@@ -304,7 +304,9 @@ def convert_validated_to_agent_format(data: dict) -> List[Dict[str, Any]]:
     Skips ruled_out, confirmed_blocked, and unlikely-verdict findings.
     Normalizes status fields in-place before filtering (idempotent).
     """
-    from packages.exploitability_validation.models import Finding
+    from packages.exploitability_validation.models import (
+        Finding, EXPLOITABLE_FINAL_STATUSES,
+    )
 
     try:
         from packages.exploitability_validation import normalize_findings
@@ -331,7 +333,7 @@ def convert_validated_to_agent_format(data: dict) -> List[Dict[str, Any]]:
             "endLine": f.line,
             "snippet": f.proof.vulnerable_code,
             "message": f.candidate_reasoning or f.message or f.rule_id or f"{f.vuln_type} in {f.function or 'unknown'}",
-            "level": "error" if f.final_status in ("exploitable", "likely_exploitable", "confirmed_constrained") else "warning",
+            "level": "error" if f.final_status in EXPLOITABLE_FINAL_STATUSES else "warning",
             "has_dataflow": bool(f.proof.flow),
             "feasibility": feasibility_d,
             "attack_path_ref": f.feasibility.attack_path_ref,
