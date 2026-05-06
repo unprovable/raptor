@@ -41,10 +41,14 @@ class _FakeProvider:
     def generate_structured(
         self, prompt: str, schema: Dict[str, Any],
         system_prompt: str | None = None,
+        **kwargs,
     ) -> Tuple[Dict[str, Any], str]:
         self.calls += 1
-        # Mimic what real providers do: bump cost/tokens so the client
-        # records non-zero deltas. Cache hits should bypass this entirely.
+        # Capture last-call kwargs so tests can assert plumbing
+        # (batch 331). Mimic what real providers do: bump
+        # cost/tokens so the client records non-zero deltas.
+        # Cache hits should bypass this entirely.
+        self.last_kwargs = dict(kwargs)
         self.total_cost += 0.001
         self.total_tokens += 100
         return self.result, self.raw
@@ -293,20 +297,20 @@ class _RecordingHandler:
         return [r.getMessage() for r in self.records]
 
 
-def test_kwargs_warning_emitted_on_drop(tmp_path: Path) -> None:
-    """The structured path must log a warning when the caller passes
-    kwargs that providers will silently drop. Without the warning the
-    drop is undiscoverable except by reading the source — the wired-up
-    cache key gives the illusion of effect."""
+def test_kwargs_plumbed_to_provider(tmp_path: Path) -> None:
+    """Caller-supplied generation kwargs (notably ``temperature``)
+    must reach the provider's ``generate_structured`` call — pre-fix
+    (batch 331) the client warned and silently dropped them, leaving
+    every DispatchTask's per-task temperature ineffective on the
+    structured path while appearing to be honoured on the freeform
+    path."""
     client = _client(tmp_path)
     fake = _FakeProvider({"k": "v"})
     _install_provider(client, fake)
 
-    with _RecordingHandler() as cap:
-        client.generate_structured("p", {"type": "object"}, temperature=0.5)
+    client.generate_structured("p", {"type": "object"}, temperature=0.5)
 
-    msgs = cap.messages()
-    assert any("temperature" in m and "ignored" in m for m in msgs), msgs
+    assert fake.last_kwargs.get("temperature") == 0.5
 
 
 def test_no_warning_when_kwargs_empty(tmp_path: Path) -> None:

@@ -700,7 +700,10 @@ class TestRealSchemaIntegration:
         assert result.data["is_exploitable"] is True
         assert result.data["confidence"] == "high"
         assert result.data["severity_assessment"] == "high"
-        assert result.data["vuln_type"] == "command_injection"
+        # batch 321 — "RCE" normalises to "other" not
+        # "command_injection". RCE is a consequence label, not a
+        # root-cause classification.
+        assert result.data["vuln_type"] == "other"
         assert result.data["prerequisites"] == ["Network access"]
         assert result.quality > 0.5
 

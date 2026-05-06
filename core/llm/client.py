@@ -892,18 +892,17 @@ class LLMClient:
                 "model_config= kwarg."
             )
 
-        # Provider impls of generate_structured don't currently accept
-        # **kwargs (signature is (prompt, schema, system_prompt)) — so
-        # any temperature / max_tokens etc. passed by the caller is
-        # silently dropped. Surface that explicitly so callers know
-        # their hint isn't taking effect; cache key still differentiates
-        # so behaviour stays correct if providers grow kwargs support.
-        if kwargs:
-            logger.warning(
-                f"generate_structured: provider impls do not accept "
-                f"{sorted(kwargs.keys())} — these kwargs are ignored. "
-                f"Cache key still differentiates by them."
-            )
+        # Provider impls of generate_structured now accept **kwargs
+        # (batch 331 — temperature plumbing). The previous warning
+        # here always fired in production because every DispatchTask
+        # passes `temperature=task.temperature`; downstream the kwarg
+        # was dropped, so structured analysis ran at provider-default
+        # temperature regardless of the task's declared value. We
+        # forward kwargs to provider.generate_structured() below;
+        # cache key already incorporates them via
+        # `_get_structured_cache_key(... kwargs)` so two calls with
+        # the same prompt + schema + model but different temperatures
+        # don't collide.
 
         # Warn if prompt likely exceeds context window (~4 chars per token)
         estimated_tokens = (len(prompt) + len(system_prompt or "")) // 4
@@ -986,7 +985,9 @@ class LLMClient:
                         tokens_before = provider.total_tokens
 
                         t_start = time.time()
-                        result_tuple = provider.generate_structured(prompt, schema, system_prompt)
+                        result_tuple = provider.generate_structured(
+                            prompt, schema, system_prompt, **kwargs,
+                        )
                         duration = time.time() - t_start
 
                         # Calculate cost delta

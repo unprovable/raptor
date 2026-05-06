@@ -146,8 +146,22 @@ class LLMProvider(ABC):
 
     @abstractmethod
     def generate_structured(self, prompt: str, schema: Dict[str, Any],
-                           system_prompt: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
-        """Generate structured output matching the provided schema."""
+                           system_prompt: Optional[str] = None,
+                           **kwargs) -> Tuple[Dict[str, Any], str]:
+        """Generate structured output matching the provided schema.
+
+        ``**kwargs`` accepts per-call generation overrides — most
+        notably ``temperature``. Pre-fix the abstract signature did
+        NOT accept kwargs, so callers passing
+        ``provider.generate_structured(prompt, schema, sp,
+        temperature=0.2)`` would TypeError, forcing
+        ``LLMClient.generate_structured`` to drop the kwarg with a
+        warning. The result: every task's `task.temperature` was
+        silently ignored on the structured-output path while
+        appearing to be honoured on the freeform path. Concrete
+        impls should prefer
+        ``kwargs.get("temperature", self.config.temperature)``.
+        """
         pass
 
     # ------------------------------------------------------------------
@@ -834,9 +848,14 @@ class OpenAICompatibleProvider(LLMProvider):
             raise
 
     def generate_structured(self, prompt: str, schema: Dict[str, Any],
-                           system_prompt: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
+                           system_prompt: Optional[str] = None,
+                           **kwargs) -> Tuple[Dict[str, Any], str]:
         """Generate structured output using Instructor (or JSON fallback)."""
         pydantic_model = _dict_schema_to_pydantic(schema)
+        # Honour caller-supplied temperature so DispatchTask's
+        # `temperature = 0.2` (analysis), `0.3` (consensus), etc.
+        # actually reach the API. Falls back to configured default.
+        temperature = kwargs.get("temperature", self.config.temperature)
 
         # Try Instructor first (skip for Anthropic via OpenAI-compat — response_format is ignored)
         is_anthropic_compat = self.config.provider.lower() == "anthropic"
@@ -852,7 +871,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     model=self.config.model_name,
                     response_model=pydantic_model,
                     messages=messages,
-                    temperature=self.config.temperature,
+                    temperature=temperature,
                     max_tokens=self.config.max_tokens,
                 )
                 duration = time.monotonic() - t_start
@@ -1358,9 +1377,14 @@ class AnthropicProvider(LLMProvider):
             raise
 
     def generate_structured(self, prompt: str, schema: Dict[str, Any],
-                           system_prompt: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
+                           system_prompt: Optional[str] = None,
+                           **kwargs) -> Tuple[Dict[str, Any], str]:
         """Generate structured output using Instructor (or JSON fallback)."""
         pydantic_model = _dict_schema_to_pydantic(schema)
+        # See OpenAI provider — caller-supplied temperature must
+        # reach the API for DispatchTask's per-task temperatures
+        # (analysis 0.2, consensus 0.3) to take effect.
+        temperature = kwargs.get("temperature", self.config.temperature)
 
         # Try Instructor first
         if self.instructor_client is not None:
@@ -1371,7 +1395,7 @@ class AnthropicProvider(LLMProvider):
                     "model": self.config.model_name,
                     "response_model": pydantic_model,
                     "messages": messages,
-                    "temperature": self.config.temperature,
+                    "temperature": temperature,
                     "max_tokens": self.config.max_tokens,
                 }
                 if system_prompt:
@@ -1894,7 +1918,8 @@ class GeminiProvider(LLMProvider):
             raise
 
     def generate_structured(self, prompt: str, schema: Dict[str, Any],
-                           system_prompt: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
+                           system_prompt: Optional[str] = None,
+                           **kwargs) -> Tuple[Dict[str, Any], str]:
         """Generate structured output using Gemini's native JSON mode."""
         # Normalize simple schema to JSON Schema format so both pydantic and
         # Gemini schema conversion see the same structure
@@ -1902,7 +1927,7 @@ class GeminiProvider(LLMProvider):
         pydantic_model = _dict_schema_to_pydantic(normalized)
 
         config_kwargs = {
-            "temperature": self.config.temperature,
+            "temperature": kwargs.get("temperature", self.config.temperature),
             "max_output_tokens": self.config.max_tokens,
             "response_mime_type": "application/json",
             "response_schema": _schema_to_gemini(normalized),
@@ -2035,8 +2060,16 @@ class ClaudeCodeProvider:
         return None
 
     def generate_structured(self, prompt: str, schema: Dict[str, Any],
-                           system_prompt: Optional[str] = None):
-        """Returns (None, None) — Claude Code will do the reasoning."""
+                           system_prompt: Optional[str] = None,
+                           **kwargs):
+        """Returns (None, None) — Claude Code will do the reasoning.
+
+        Accepts and ignores ``**kwargs`` (notably ``temperature``):
+        the `claude` CLI doesn't expose a temperature flag, so any
+        per-call override is structurally a no-op here. Accepting
+        kwargs prevents TypeError when callers route through the
+        unified `LLMClient.generate_structured` plumbing.
+        """
         return None, None
 
     def get_stats(self) -> Dict[str, Any]:
@@ -2200,8 +2233,13 @@ class ClaudeCodeLLMProvider(LLMProvider):
         prompt: str,
         schema: Dict[str, Any],
         system_prompt: Optional[str] = None,
+        **kwargs,
     ) -> Tuple[Dict[str, Any], str]:
-        """Dispatch with ``--json-schema`` for structured output."""
+        """Dispatch with ``--json-schema`` for structured output.
+
+        Accepts and ignores ``**kwargs`` — `claude` CLI has no
+        temperature flag (see ClaudeCodeProvider.generate_structured).
+        """
         from .cc_adapter import (
             CCDispatchConfig, build_cc_command, parse_cc_structured,
         )
