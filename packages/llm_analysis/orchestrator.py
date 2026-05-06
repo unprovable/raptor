@@ -846,6 +846,20 @@ def orchestrate(
     if defense_telemetry.has_warnings:
         merged["orchestration"]["defense_telemetry"] = defense_telemetry.summary()
 
+    # Strip the host-side `repo_path` we stamped onto every
+    # finding for SAGE enrichment scoping (line ~303). It's an
+    # absolute filesystem path on the operator's machine
+    # (`/home/alice/projects/my-target`, `/tmp/raptor/foo`) and
+    # leaking it into the persisted report exposes operator
+    # filesystem layout downstream — anyone the report is
+    # shared with sees username, project naming conventions,
+    # and the runner's tmp-dir hierarchy. Pop AFTER all
+    # internal consumers have used it (judge, consensus,
+    # aggregation) and BEFORE save_json hits disk.
+    for f in merged.get("results", []):
+        if isinstance(f, dict):
+            f.pop("repo_path", None)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     from core.json import save_json
     if correlation:
