@@ -6,6 +6,7 @@ Task subclasses define semantics: what prompt, what schema, which model.
 """
 
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
@@ -118,14 +119,54 @@ def _format_elapsed(seconds: float) -> str:
     return format_elapsed(seconds)
 
 
+# Word-boundary patterns for auth and classify_error keywords.
+# Pre-fix the substring `in lower` checks produced false positives:
+#   * `"401"` matched any error string containing the digits "401"
+#     anywhere — including stack-trace line numbers (`line 401, in
+#     ...`), HTTP status logs from unrelated endpoints, content-
+#     length headers, etc.
+#   * `"safety"` matched legitimate non-content-filter contexts
+#     ("safety check failed in tokenizer", "thread-safety
+#     violation", "safe to retry").
+#   * `"credit"` matched "credentials", "credit card validation",
+#     "discredit". The intent was billing-credit-exhausted but
+#     the substring caught everything credit-shaped.
+#   * `"refusal"` was OK as a substring; "refused request" was
+#     fine; but neither is reliably emitted by all providers.
+# Word-boundary regex via `\b...\b` keeps the keywords but
+# anchors them to token boundaries.
+_AUTH_KEYWORDS_RE = re.compile(
+    # Bare 401/403 only when preceded by a status-context word
+    # (HTTP, status, code) — "line 401" in a stack trace
+    # otherwise false-positives. Word words remain unconstrained.
+    r"\b((?:http|status|code)\s+40[13]\b|"
+    r"40[13]\s+(?:unauthorized|forbidden)|"
+    r"authentication|unauthorized|invalid api key|billing|"
+    r"quota|rate limit|insufficient_quota|credits?|"
+    r"api[_ ]?key (?:invalid|expired|missing))\b",
+    re.IGNORECASE,
+)
+
+_BLOCKED_KEYWORDS_RE = re.compile(
+    r"\b(content filter|blocked response|content (?:policy|safety) violation|"
+    r"refused (?:request|to respond)|response (?:was )?refused|"
+    r"safety filter|content blocked|moderation block)\b",
+    re.IGNORECASE,
+)
+
+_TIMEOUT_KEYWORDS_RE = re.compile(
+    r"\b(timeout|timed out|deadline exceeded|read timed? out)\b",
+    re.IGNORECASE,
+)
+
+
 def _is_auth_error(error_str: str) -> bool:
-    """Check if an error string indicates an authentication/billing failure."""
-    lower = error_str.lower()
-    return any(x in lower for x in [
-        "401", "403", "authentication", "unauthorized",
-        "invalid api key", "billing", "quota", "rate limit",
-        "insufficient_quota", "credit",
-    ])
+    """Check if an error string indicates an authentication/billing failure.
+
+    Word-boundary matched (see module-level RE comments) so a
+    "line 401, in foo" stack-trace fragment doesn't false-positive.
+    """
+    return bool(_AUTH_KEYWORDS_RE.search(error_str or ""))
 
 
 def _classify_error(error_str: str) -> str:
@@ -133,14 +174,16 @@ def _classify_error(error_str: str) -> str:
 
     Returns: 'blocked' (content filter/safety/refusal), 'auth' (key/billing/quota),
     'timeout', or 'error' (everything else).
+
+    Uses word-boundary regex matching — see module RE comments for
+    the substring false-positives this fixes.
     """
-    lower = error_str.lower()
-    if any(x in lower for x in ["content filter", "blocked response", "safety",
-                                 "refused request", "refusal"]):
+    text = error_str or ""
+    if _BLOCKED_KEYWORDS_RE.search(text):
         return "blocked"
-    if _is_auth_error(error_str):
+    if _is_auth_error(text):
         return "auth"
-    if any(x in lower for x in ["timeout", "timed out"]):
+    if _TIMEOUT_KEYWORDS_RE.search(text):
         return "timeout"
     return "error"
 
