@@ -290,10 +290,23 @@ def dispatch_task(
                     if nonce_leaked_in(nonce, raw_text):
                         processed["_nonce_leaked"] = True
 
-                # Feed costs to tracker for budget enforcement
+                # Feed costs AND tokens to tracker. Pre-fix only
+                # `cost` was passed; the dispatch_result already
+                # carried `tokens` (provider-reported usage from
+                # external LLM clients, or _tokens parsed from CC
+                # subprocess envelope). CostTracker stored token
+                # totals (`_total_tokens`, `_thinking_tokens`)
+                # but they stayed at 0 across every run because
+                # this single call site was the funnel and it
+                # dropped the kwarg. `get_summary()` then
+                # reported `total_tokens: 0` regardless of actual
+                # usage, breaking telemetry, cost-per-token
+                # diagnostics, and the model-economy reports the
+                # operator UI surfaces.
                 if item_cost > 0:
                     model_name = processed.get("analysed_by", "unknown")
-                    cost_tracker.add_cost(model_name, item_cost)
+                    item_tokens = getattr(dispatch_result, "tokens", 0) or 0
+                    cost_tracker.add_cost(model_name, item_cost, tokens=item_tokens)
 
                 # Progress line
                 display = task.get_item_display(item)
