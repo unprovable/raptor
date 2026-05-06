@@ -145,7 +145,8 @@ def parse_literal_value(tok: str, profile: BVProfile) -> Union[int, Rejection]:
     - Anything that isn't a clean hex or decimal literal
       → :data:`RejectionKind.UNRECOGNIZED_OPERAND`.
     """
-    if _HEX_LITERAL_RE.fullmatch(tok):
+    is_hex = bool(_HEX_LITERAL_RE.fullmatch(tok))
+    if is_hex:
         v = int(tok, 16)
     elif _DEC_LITERAL_RE.fullmatch(tok):
         if len(tok) > 1 and tok[0] == "0":
@@ -160,21 +161,42 @@ def parse_literal_value(tok: str, profile: BVProfile) -> Union[int, Rejection]:
             tok, RejectionKind.UNRECOGNIZED_OPERAND,
             f"token {tok!r} is not a hex or decimal literal",
         )
-    # Range check honours signedness. For an unsigned profile the
-    # representable range is [0, 2^width - 1]; for a signed profile
-    # (positive literals only — the regex rejects leading '-') the
-    # representable positive range is [0, 2^(width-1) - 1].
+    # Range check, with hex vs decimal distinction:
     #
-    # Pre-fix the check used `v >= (1 << profile.width)` for both,
-    # so the literal `200` at int8 profile (signed, range -128..127)
-    # was accepted — it's < 256, but doesn't fit in a signed int8.
-    # Z3 then silently re-interpreted the bit pattern as -56,
-    # producing a verdict that didn't match the source intent.
-    upper_exclusive = (1 << (profile.width - 1)) if profile.signed else (1 << profile.width)
+    # * Hex literals are BIT PATTERNS. `0x80000000` at int32
+    #   profile represents the underlying bit pattern of -2^31,
+    #   which IS representable as signed int32 (just at the
+    #   negative end of two's complement). Allow up to 2^width
+    #   regardless of signedness — width caps what the bit
+    #   pattern can encode, signedness only changes how Z3
+    #   *interprets* the value during model rendering.
+    #
+    # * Decimal literals are NUMERICAL values. `200` at int8
+    #   profile (signed, range -128..127) doesn't fit even though
+    #   the bit pattern (0xC8) does — Z3 would silently
+    #   reinterpret it as -56, producing a verdict that didn't
+    #   match the source intent. Cap decimal literals at
+    #   2^(width-1) for signed profiles. (The regex rejects
+    #   leading '-', so we only see positive decimals here.)
+    #
+    # Pre-batch-210 the check used `v >= (1 << profile.width)`
+    # uniformly, which over-accepted decimal literals (the `200`
+    # at int8 case). Batch 210 over-corrected by tightening BOTH
+    # paths, which over-rejected hex literals like `0x80000000`
+    # at int32. This split restores hex support while keeping the
+    # decimal sign-discipline.
+    if is_hex or not profile.signed:
+        upper_exclusive = 1 << profile.width
+    else:
+        upper_exclusive = 1 << (profile.width - 1)
     if v >= upper_exclusive:
+        if is_hex:
+            range_desc = f"{profile.width}-bit range"
+        else:
+            range_desc = f"{profile.describe()} positive range"
         return Rejection(
             tok, RejectionKind.LITERAL_OUT_OF_RANGE,
-            f"value {v:#x} exceeds {profile.describe()} positive range "
+            f"value {v:#x} exceeds {range_desc} "
             f"(max {upper_exclusive - 1:#x})",
         )
     return v
