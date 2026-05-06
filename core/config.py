@@ -468,23 +468,37 @@ class RaptorConfig:
         """
         Resolve the output directory, honoring RAPTOR_OUT_DIR environment variable.
 
-        Warns if the output directory is a system path that could be dangerous.
+        Refuses system paths that could be dangerous. Pre-fix this
+        WARNED but still returned the resolved path — the operator's
+        next `mkdir(out_dir, ...)` then created or polluted system
+        directories. Refuse outright with ValueError so the caller
+        sees the misconfiguration immediately and can correct
+        RAPTOR_OUT_DIR before any filesystem damage.
+
+        Match prefixes on path-component boundary so `/usr-local-foo`
+        doesn't false-match the `/usr` rule.
 
         Returns:
             Path: Resolved output directory path
+
+        Raises:
+            ValueError: when RAPTOR_OUT_DIR points at a system prefix.
         """
         base = os.environ.get(RaptorConfig.ENV_OUT_DIR)
         if not base:
             return RaptorConfig.BASE_OUT_DIR
         resolved = Path(base).resolve()
         forbidden = ("/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys")
+        resolved_str = str(resolved)
         for prefix in forbidden:
-            if str(resolved).startswith(prefix):
-                import logging
-                logging.getLogger(__name__).warning(
-                    f"RAPTOR_OUT_DIR points to system path {resolved} — this is likely a misconfiguration"
+            # Component-boundary match: equals or starts with `prefix/`.
+            if resolved_str == prefix or resolved_str.startswith(prefix + "/"):
+                raise ValueError(
+                    f"RAPTOR_OUT_DIR={resolved!r} resolves under system "
+                    f"path {prefix!r}. Refusing to create output there. "
+                    f"Set RAPTOR_OUT_DIR to a path under your home or a "
+                    f"dedicated work directory."
                 )
-                break
         return resolved
 
     @staticmethod
