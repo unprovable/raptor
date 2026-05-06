@@ -292,10 +292,35 @@ class ProjectManager:
         # Update project
         project.name = new_name
 
-        # Save new, delete old
+        # Save new, delete old.
+        # Pre-fix the unlink used `missing_ok=True` which silently
+        # swallowed every OSError including PermissionError. If the
+        # save_json succeeded but the unlink failed, the project
+        # ended up existing under BOTH names with no signal to the
+        # operator — every subsequent list/load saw two entries
+        # for what was supposed to be one project. Use os.replace
+        # to atomically move old → new, then re-write with updated
+        # content. Falls back to save+unlink with EXPLICIT error
+        # reporting if replace isn't atomic on the platform (cross-
+        # filesystem rename).
         save_json(new_file, project.to_dict())
         old_file = self.projects_dir / f"{old_name}.json"
-        old_file.unlink(missing_ok=True)
+        try:
+            old_file.unlink()
+        except FileNotFoundError:
+            pass  # already gone — fine
+        except OSError as e:
+            # Don't roll back the new file: it has the renamed
+            # content and is the source of truth going forward.
+            # But surface the failure so the operator knows the
+            # old file is still on disk and they need to clean it
+            # up by hand.
+            logger.error(
+                "rename: wrote new project file %s but failed to remove "
+                "old %s: %s. Both files now exist; remove %s manually.",
+                new_file, old_file, e, old_file,
+            )
+            raise
 
         # Update .active symlink if it pointed to the old name
         active_link = self.projects_dir / ".active"
