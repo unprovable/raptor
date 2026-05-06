@@ -7,11 +7,14 @@ produced it, when, and whether it succeeded. Tools use start_run/complete_run/fa
 import contextlib
 import os
 import re
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from core.json import load_json, save_json
+
+logger = logging.getLogger(__name__)
 
 RUN_METADATA_FILE = ".raptor-run.json"
 
@@ -561,6 +564,9 @@ def generate_run_metadata(run_dir: Path) -> None:
     save_json(run_dir / RUN_METADATA_FILE, metadata)
 
 
+_TERMINAL_STATUSES = frozenset({STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED})
+
+
 def _update_status(output_dir: Path, status: str, extra: Dict[str, Any] = None,
                    record_timing: bool = True) -> None:
     """Update the status field in .raptor-run.json.
@@ -569,12 +575,33 @@ def _update_status(output_dir: Path, status: str, extra: Dict[str, Any] = None,
     duration_seconds. Set to False for sweep/cleanup where the run ended
     at an unknown earlier time.
 
+    Terminal-status guard: refuses to overwrite an already-terminal
+    state (completed / failed / cancelled). Pre-fix the function
+    silently flipped any status to any other status, so:
+      * `fail_run` called after `complete_run` (e.g. by exception
+        handlers in caller's `finally` after the lifecycle already
+        completed) downgraded a successful run to failed, masking
+        the actual outcome.
+      * `complete_run` called after `fail_run` (cleanup loop racing
+        a real failure handler) upgraded a failed run to completed
+        — operator sees green, the failure is invisible.
+    Logs at warning level so the racing-caller bug is investigable
+    rather than hidden.
+
     Raises FileNotFoundError if metadata file doesn't exist (call start_run first).
     """
     path = Path(output_dir) / RUN_METADATA_FILE
     metadata = load_json(path)
     if metadata is None:
         raise FileNotFoundError(f"No {RUN_METADATA_FILE} in {output_dir} — call start_run() first")
+    current = metadata.get("status")
+    if current in _TERMINAL_STATUSES and current != status:
+        logger.warning(
+            "Refusing to overwrite terminal status %r → %r in %s "
+            "(probable double-finalisation; investigate caller)",
+            current, status, output_dir,
+        )
+        return
     metadata["status"] = status
 
     if record_timing:
