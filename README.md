@@ -231,6 +231,12 @@ export RAPTOR_MAX_COST=5.00   # cap analysis spend at $5 per run
 
 Ollama works for analysis but produces unreliable exploit and patch code. For code generation tasks, use a frontier model.
 
+### Fast-tier short-circuit + the model scorecard
+
+When your analysis-tier model has a same-provider cheaper sibling (Anthropic Opus → Haiku, OpenAI 5.x → 4o-mini, Gemini Pro → Flash-Lite, Mistral Large → Small), RAPTOR will use it as a prefilter on consumers that wire into the substrate (codeql today; SCA and others as follow-ups land). The cheap model only ever short-circuits on **confident false positives**; ambiguous cases and confident-TPs always run the full analysis. Trust accumulates per `(model, decision_class)` cell — RAPTOR records cheap-vs-full agreement and only short-circuits once the Wilson 95% upper-bound on the cell's miss-rate falls at or below 5%.
+
+To inspect what your models are good at, use `/scorecard` (or directly: `libexec/raptor-llm-scorecard list`). The scorecard is global (lessons carry across projects) and persists at `out/llm_scorecard.json`.
+
 ---
 
 ## Projects

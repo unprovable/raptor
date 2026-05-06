@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Inspect / maintain the model scorecard (core/llm/scorecard/cli.py).
+# Surfaces per-model reliability across decision classes — research
+# instrument as much as ops tool.
+#
+# Run with --help (or any subcommand --help) for usage.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$REPO_ROOT"
+exec python3 -m core.llm.scorecard.cli "$@"

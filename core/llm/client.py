@@ -260,6 +260,11 @@ class LLMClient:
         # is in practice a single-run object.
         self._key_locks: Dict[str, threading.Lock] = {}
         self._key_locks_guard = threading.Lock()
+        # Lazy-built model scorecard. Stays None until a consumer
+        # asks for it via the ``scorecard`` property; constructing
+        # one is cheap but it does open a file handle and create
+        # the parent dir, so we defer until needed.
+        self._scorecard = None
 
         # HEALTH CHECK: Warn if no API keys configured
         from .detection import detect_llm_availability
@@ -344,6 +349,28 @@ class LLMClient:
                 "available, instead of constructing LLMClient directly."
             )
         return self._get_provider(self.config.primary_model)
+
+    @property
+    def scorecard(self):
+        """The :class:`~core.llm.scorecard.ModelScorecard` for this
+        client's config, or ``None`` when scorecard is disabled.
+
+        Lazy-built on first access — the constructor doesn't pay the
+        directory-creation cost for clients that never consult the
+        scorecard. Returns the same instance across calls so per-key
+        flock contention is bounded by physical concurrency, not by
+        accidental property re-evaluation.
+        """
+        if not self.config.scorecard_enabled:
+            return None
+        if self._scorecard is None:
+            from .scorecard import ModelScorecard
+            self._scorecard = ModelScorecard(
+                self.config.scorecard_path,
+                retain_samples=self.config.scorecard_retain_samples,
+                shadow_rate=self.config.scorecard_shadow_rate,
+            )
+        return self._scorecard
 
     def _key_lock(self, cache_key: str) -> "threading.Lock":
         """Return (creating if needed) a per-key lock used to dedupe
