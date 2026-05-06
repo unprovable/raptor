@@ -170,6 +170,35 @@ class RaptorLogger:
 
 
 # Global logger instance
-def get_logger() -> RaptorLogger:
-    """Get the global RAPTOR logger instance."""
-    return RaptorLogger()
+def get_logger(name: Optional[str] = None) -> "logging.Logger":
+    """Get a RAPTOR logger.
+
+    With no `name` (default): returns the singleton RaptorLogger
+    wrapper for the framework's audit-trail behaviour.
+
+    With a `name`: returns a `logging.Logger` child of "raptor"
+    namespaced under that name, e.g. `get_logger("core.sarif")`
+    returns `logging.getLogger("raptor.core.sarif")`. Lets modules
+    distinguish their log lines for grep-by-source while still
+    inheriting the framework's handler / formatter configuration
+    (Python logging propagates from child to parent by default,
+    so the audit-trail file handler still picks up child logs as
+    long as `propagate=True`).
+
+    Pre-fix `get_logger()` accepted no args — every caller got the
+    same flat-namespace singleton, making it impossible to filter
+    logs by source module without textual greps. Modules that DID
+    want a per-module logger had to bypass `get_logger` entirely
+    and call `logging.getLogger(__name__)` directly, defeating the
+    centralisation.
+    """
+    # Always ensure the base singleton is initialised first
+    # (handlers attached, audit file open) before any caller
+    # creates a child logger that needs to inherit from it.
+    base = RaptorLogger()
+    if name is None:
+        return base
+    # Namespace under "raptor" so child propagation reaches the
+    # audit handlers attached to the base "raptor" logger.
+    safe_name = name if name.startswith("raptor.") else f"raptor.{name}"
+    return logging.getLogger(safe_name)
