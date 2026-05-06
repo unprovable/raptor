@@ -18,14 +18,77 @@ this pattern.
 """
 
 import json
+import logging
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from .base import ToolAdapter, ToolCapability, ToolEvidence, make_sandbox_runner
+
+logger = logging.getLogger(__name__)
+
+
+# Process-scoped cache of pack dirs we've already attempted to install.
+# Pack-install is idempotent and fast on subsequent calls (just reads the
+# lockfile), but skipping the subprocess entirely is cheaper.
+_INSTALLED_PACK_DIRS: Set[Path] = set()
+
+
+def _find_pack_dir(query_path: Path) -> Optional[Path]:
+    """Walk up from a .ql file looking for the containing pack's qlpack.yml.
+
+    Bounds the walk to a few levels — pack layouts are
+    `<pack>/Security/CWE-NNN/file.ql` (3 up) or
+    `<pack>/<version>/Security/CWE-NNN/file.ql` (4 up).
+    """
+    for parent in query_path.resolve().parents[:5]:
+        if (parent / "qlpack.yml").is_file():
+            return parent
+    return None
+
+
+def _ensure_pack_installed(
+    query_path: Path,
+    codeql_bin: str,
+    runner,
+    env: Dict[str, str],
+) -> None:
+    """Run `codeql pack install` on the query's containing pack if needed.
+
+    Skipped when:
+      - The query lives outside any qlpack.yml-owning directory
+      - The pack already has a `codeql-pack.lock.yml` (already installed)
+      - We've already attempted install for this pack in this process
+
+    Failures are logged but do not raise — the subsequent
+    `codeql database analyze` call surfaces a clearer error if the
+    install was actually required.
+    """
+    pack_dir = _find_pack_dir(Path(query_path))
+    if pack_dir is None:
+        return
+    if pack_dir in _INSTALLED_PACK_DIRS:
+        return
+    _INSTALLED_PACK_DIRS.add(pack_dir)
+
+    if (pack_dir / "codeql-pack.lock.yml").is_file():
+        # Already installed — pack-install would be a no-op.
+        return
+
+    try:
+        runner(
+            [codeql_bin, "pack", "install", str(pack_dir)],
+            capture_output=True, text=True,
+            timeout=180, env=env,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.warning(
+            "codeql pack install on %s failed: %s — analyze may fail with a clearer error",
+            pack_dir, e,
+        )
 
 
 _SYNTAX_EXAMPLE = """\
@@ -117,6 +180,126 @@ class CodeQLAdapter(ToolAdapter):
             ],
             syntax_example=_SYNTAX_EXAMPLE,
             languages=["c", "cpp", "java", "python", "javascript", "typescript", "go", "csharp", "ruby", "swift"],
+        )
+
+    def run_prebuilt_query(
+        self,
+        query_path: Path,
+        target: Path,
+        *,
+        timeout: int = 300,
+        env: Optional[Dict[str, str]] = None,
+    ) -> ToolEvidence:
+        """Invoke an existing pack-resident .ql file directly.
+
+        Unlike `run`, no temp pack / qlpack.yml is materialised — the
+        prebuilt query already lives inside an installed pack so its
+        imports and dependencies are pre-resolved. We call
+        `codeql database analyze <db> <abs-ql-path>` and parse the SARIF.
+
+        `query_path` MUST be an absolute path to a `.ql` file produced
+        by `dataflow_query_builder.discover_prebuilt_query`. The path
+        is recorded as the `rule` field on the evidence so callers can
+        identify which prebuilt query handled the hypothesis (audit
+        trail, telemetry).
+
+        target / timeout / env behave the same as `run()`.
+        """
+        rule_label = str(query_path)
+        if not self._codeql_bin:
+            return ToolEvidence(
+                tool=self.name, rule=rule_label, success=False,
+                error="codeql CLI is not installed",
+            )
+        if not self._database_path:
+            return ToolEvidence(
+                tool=self.name, rule=rule_label, success=False,
+                error="no CodeQL database configured (set_database() first)",
+            )
+        if not self._database_path.exists():
+            return ToolEvidence(
+                tool=self.name, rule=rule_label, success=False,
+                error=f"CodeQL database not found: {self._database_path}",
+            )
+        if not query_path or not Path(query_path).is_file():
+            return ToolEvidence(
+                tool=self.name, rule=rule_label, success=False,
+                error=f"prebuilt query file not found: {query_path}",
+            )
+
+        if env is None:
+            from core.config import RaptorConfig
+            env = RaptorConfig.get_safe_env()
+
+        runner = (
+            make_sandbox_runner(target=self._database_path)
+            if self._sandbox else subprocess.run
+        )
+
+        # Lazy pack-install: in-repo packs (under EXTRA_CODEQL_PACK_ROOTS)
+        # ship a qlpack.yml but no codeql-pack.lock.yml in fresh checkouts.
+        # Without the lockfile codeql can't resolve the pack's
+        # dependencies (codeql/python-all etc.) when invoking via
+        # absolute query path. Standard installed packs (under
+        # ~/.codeql/packages/codeql/) always have lockfiles already,
+        # so this is a no-op for them.
+        _ensure_pack_installed(query_path, self._codeql_bin, runner, env)
+
+        try:
+            with TemporaryDirectory(prefix="codeql_prebuilt_") as tmp:
+                sarif_path = Path(tmp) / "result.sarif"
+                cmd = [
+                    self._codeql_bin,
+                    "database", "analyze",
+                    str(self._database_path),
+                    str(query_path),
+                    "--format=sarif-latest",
+                    f"--output={sarif_path}",
+                    "--no-rerun",
+                ]
+                try:
+                    proc = runner(
+                        cmd, capture_output=True, text=True,
+                        timeout=timeout, env=env,
+                    )
+                except subprocess.TimeoutExpired:
+                    return ToolEvidence(
+                        tool=self.name, rule=rule_label, success=False,
+                        error=f"codeql timeout after {timeout}s",
+                    )
+                except OSError as e:
+                    return ToolEvidence(
+                        tool=self.name, rule=rule_label, success=False,
+                        error=f"failed to invoke codeql: {e}",
+                    )
+
+                if proc.returncode != 0 or not sarif_path.exists():
+                    err = (proc.stderr or proc.stdout or "").strip()
+                    return ToolEvidence(
+                        tool=self.name, rule=rule_label, success=False,
+                        error=err[:500] or f"codeql returned {proc.returncode}",
+                    )
+
+                matches = _parse_sarif(sarif_path)
+        except OSError as e:
+            return ToolEvidence(
+                tool=self.name, rule=rule_label, success=False,
+                error=f"workspace setup failed: {e}",
+            )
+
+        n = len(matches)
+        files = sorted({m["file"] for m in matches if m.get("file")})
+        if n:
+            summary = f"{n} match{'es' if n != 1 else ''} in {len(files)} file{'s' if len(files) != 1 else ''}"
+        else:
+            summary = "no matches"
+
+        return ToolEvidence(
+            tool=self.name,
+            rule=rule_label,
+            success=True,
+            matches=matches,
+            summary=summary,
         )
 
     def run(

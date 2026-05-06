@@ -20,9 +20,10 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from packages.llm_analysis.cc_dispatch import invoke_cc_simple
+from packages.llm_analysis.finding_adapter import FindingAdapter
 from core.reporting.formatting import format_elapsed as _format_elapsed
 
 logger = logging.getLogger(__name__)
@@ -281,6 +282,19 @@ def orchestrate(
         print("\n  No findings to analyse")
         return None
 
+    # Reset the per-run defense telemetry singleton. The singleton
+    # accumulates per-model counters (response shape, schema retries,
+    # nonce-leak warnings) and is process-wide; without an explicit
+    # reset here, a long-lived orchestrator (e.g. running back-to-back
+    # via the supervisor or in test harnesses that re-invoke
+    # orchestrate without process restart) would carry state from the
+    # prior run into this one, mis-attributing counters and producing
+    # one-shot warnings that wouldn't fire again until process restart.
+    # Keep the call here (not at module import time) so callers that
+    # construct their own DefenseTelemetry don't get clobbered.
+    from core.security import prompt_telemetry as _pt
+    _pt.defense_telemetry.reset()
+
     # Stamp repo_path so build_analysis_prompt_bundle_from_finding forwards it to
     # enrich_analysis_prompt; without this SAGE per-repo scoping (#198) makes
     # the enrichment a no-op for every finding on the dispatch path.
@@ -354,11 +368,27 @@ def orchestrate(
         from core.llm.client import LLMClient
         client = LLMClient(llm_config)
 
+        # Multi-model duplicate guard: when a primary model fails and
+        # the client silently falls back, the fallback target may
+        # already be one of the OTHER active analysis models — and the
+        # multi-model panel collapses to duplicate analysed_by entries
+        # (e.g. ``[pro, flash]`` becomes ``[flash, flash]`` if pro
+        # falls back to flash). Pass the names of all active analysis
+        # models to the client so it skips them as fallback targets
+        # for any one dispatch. Other fallback targets (cross-family
+        # resilience) still work normally.
+        _active_analysis_names = {
+            m.model_name for m in role_resolution.get("analysis_models", [])
+            if m and getattr(m, "model_name", None)
+        }
+
         def dispatch_fn(prompt, schema, system_prompt, temperature, model):
+            other_active = _active_analysis_names - {model.model_name}
             if schema:
                 response = client.generate_structured(
                     prompt=prompt, schema=schema, system_prompt=system_prompt,
                     model_config=model, temperature=temperature,
+                    exclude_fallback_to=other_active,
                 )
                 result = response.result
                 quality = 1.0
@@ -376,6 +406,7 @@ def orchestrate(
                 response = client.generate(
                     prompt=prompt, system_prompt=system_prompt,
                     model_config=model, temperature=temperature,
+                    exclude_fallback_to=other_active,
                 )
                 return DispatchResult(
                     result={"content": response.content}, cost=response.cost,
@@ -487,17 +518,16 @@ def orchestrate(
 
     n_analysis_models = len(role_resolution.get("analysis_models", []))
     findings_by_id = {f.get("finding_id"): f for f in findings if f.get("finding_id")}
+    _finding_adapter = FindingAdapter()
     for fid, model_results in _multi_results.items():
         if len(model_results) == 1:
             primary = model_results[0]
         else:
-            primary = _select_primary_result(model_results)
+            primary = _finding_adapter.select_primary_with_error_fallback(model_results)
             primary["multi_model_analyses"] = [
-                {"model": r.get("analysed_by", "?"),
-                 "is_exploitable": r.get("is_exploitable"),
-                 "exploitability_score": r.get("exploitability_score"),
-                 "ruling": r.get("ruling"),
-                 "reasoning": r.get("reasoning", "")}
+                _finding_adapter.extract_analysis_record(
+                    r, r.get("analysed_by", "?"),
+                )
                 for r in model_results
             ]
         source = findings_by_id.get(fid, {})
@@ -505,6 +535,24 @@ def orchestrate(
             if key not in primary and source.get(key) is not None:
                 primary[key] = source.get(key)
         results_by_id[fid] = primary
+
+    # Multi-model collapse detection. The exclude_fallback_to guard above
+    # prevents most cases where a primary's failure routes silently into
+    # another active analysis model. The corner case it doesn't catch:
+    # multiple primaries failing concurrently and converging on the same
+    # external fallback (e.g., both pro and flash falling back to haiku).
+    # Surface that here so operators don't silently get a single-model
+    # result labelled as multi-model.
+    if n_analysis_models > 1:
+        collapsed = _detect_multi_model_collapse(results_by_id, n_analysis_models)
+        if collapsed:
+            logger.warning(
+                f"Multi-model collapse: {len(collapsed)}/"
+                f"{len(results_by_id)} finding(s) had fewer than "
+                f"{n_analysis_models} distinct contributors. Likely caused "
+                f"by silent fallback during model failure. First few: "
+                f"{collapsed[:3]}"
+            )
 
     # --- IRIS-style dataflow validation (opt-in via --validate-dataflow) ---
     # For Semgrep findings where the LLM claimed a dataflow path but no
@@ -982,34 +1030,33 @@ def _build_aggregation_payload(
     }
 
 
-def _select_primary_result(model_results: List[Dict]) -> Dict:
-    """Pick the best result from multiple models' analyses of the same finding.
+def _detect_multi_model_collapse(
+    results_by_id: Dict[str, Dict],
+    n_analysis_models: int,
+) -> List[Tuple[str, List[str]]]:
+    """Identify findings whose multi_model_analyses has fewer DISTINCT
+    contributors than the requested model count.
 
-    Prefers: exploitable verdicts (conservative), then highest quality score,
-    then highest exploitability_score.
+    Returns a list of ``(finding_id, sorted_distinct_models)`` for each
+    such finding. Empty if every multi-model finding has the expected
+    number of contributors.
+
+    Helps operators spot silent-fallback failures where multiple primary
+    models converged on the same external fallback model.
     """
-    best = model_results[0]
-    for r in model_results[1:]:
-        if "error" in r:
+    collapsed: List[Tuple[str, List[str]]] = []
+    for fid, item in results_by_id.items():
+        analyses = item.get("multi_model_analyses")
+        if not isinstance(analyses, list) or not analyses:
             continue
-        if "error" in best:
-            best = r
-            continue
-        r_expl = r.get("is_exploitable", False)
-        b_expl = best.get("is_exploitable", False)
-        if r_expl and not b_expl:
-            best = r
-        elif r_expl == b_expl:
-            r_q = r.get("_quality", 1.0)
-            b_q = best.get("_quality", 1.0)
-            if r_q > b_q:
-                best = r
-            elif r_q == b_q:
-                r_s = r.get("exploitability_score", 0) or 0
-                b_s = best.get("exploitability_score", 0) or 0
-                if r_s > b_s:
-                    best = r
-    return dict(best)
+        distinct = {
+            a.get("model") for a in analyses if isinstance(a, dict)
+        }
+        distinct.discard("?")
+        distinct.discard(None)
+        if len(distinct) < n_analysis_models:
+            collapsed.append((fid, sorted(distinct)))
+    return collapsed
 
 
 def _check_self_consistency(results_by_id: Dict[str, Dict]) -> None:
