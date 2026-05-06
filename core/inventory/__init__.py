@@ -78,16 +78,32 @@ def save_checklist(output_dir, data):
     # Ensure parent exists
     checklist_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # File lock for concurrent write safety
+    # File lock for concurrent write safety.
+    #
+    # `lock_file` initialised to None BEFORE the try so the finally
+    # block doesn't raise NameError when open(lock_path, "w") itself
+    # raises (permission denied, parent read-only after the mkdir
+    # call but before this open, disk full). Pre-fix the NameError
+    # masked the real OSError, so operators saw "name 'lock_file' is
+    # not defined" instead of "permission denied" — much harder to
+    # diagnose.
     lock_path = checklist_path.with_suffix(".lock")
+    lock_file = None
     try:
         lock_file = open(lock_path, "w")
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         save_json(checklist_path, data)
     finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                lock_file.close()
+            except Exception:
+                pass
         try:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-            lock_file.close()
             lock_path.unlink(missing_ok=True)
         except Exception:
             pass
