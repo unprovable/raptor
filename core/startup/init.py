@@ -102,11 +102,29 @@ def _tighten_config_perms(path: Path) -> str | None:
         return (f"⚠ {path} not owned by current user "
                 f"(mode {oct(st.st_mode)[-3:]}). Fix perms manually.")
 
+    # Open with O_NOFOLLOW + fchmod to close a TOCTOU race. Pre-fix
+    # the sequence was `lstat` (not a symlink) → `os.chmod(path,
+    # 0o600)`. `os.chmod` follows symlinks. Between the lstat and
+    # the chmod, an attacker (or a careless install script) could
+    # swap the file for a symlink to e.g. `/etc/passwd` — our
+    # chmod would then change perms on the swap target. ELOOP from
+    # the kernel when the path is now a symlink → falls through to
+    # the OSError handler with a meaningful message.
     try:
-        os.chmod(path, 0o600)
+        fd = os.open(
+            str(path),
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
     except OSError as e:
+        return (f"⚠ {path} could not be opened for chmod: {e}. "
+                f"Run: chmod 600 {path}")
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError as e:
+        os.close(fd)
         return (f"⚠ {path} mode {oct(st.st_mode)[-3:]} and chmod failed: {e}. "
                 f"Run: chmod 600 {path}")
+    os.close(fd)
 
     return (f"tightened {path} permissions to 600 "
             f"(was {oct(st.st_mode)[-3:]}; contains API keys)")
