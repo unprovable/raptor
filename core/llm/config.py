@@ -857,6 +857,26 @@ class LLMConfig:
     cache_max_entries: Optional[int] = None
     enable_cost_tracking: bool = True
     max_cost_per_scan: float = 10.0  # USD
+    # Model scorecard (core/llm/scorecard) — track per-model
+    # reliability across decision classes and use measured miss-rate
+    # to gate fast-tier short-circuit decisions. None or False
+    # means consumers run their full path without scorecard
+    # consultation.
+    scorecard_path: Path = Path("out/llm_scorecard.json")
+    scorecard_enabled: bool = True
+    # When False, do not retain disagreement-sample reasoning text.
+    # Defense-in-depth privacy switch for operators on shared
+    # infrastructure where the LLM's reasoning summary may quote
+    # source code under analysis.
+    scorecard_retain_samples: bool = True
+    # Probability (0-1) that a call to a trusted (short-circuiting)
+    # cell still runs full ANALYSE so fresh ground-truth comparison
+    # data keeps flowing in — drift detection via random sampling.
+    # Default 5%: catches drift within ~20-60 trusted calls while
+    # preserving most of the savings (~95% short-circuit retained).
+    # Set 0.0 to disable (trusted = forever-trusted until manual
+    # reset); set higher to validate more aggressively.
+    scorecard_shadow_rate: float = 0.05
 
     def __post_init__(self) -> None:
         """Seed ``specialized_models`` with same-provider fast-tier
