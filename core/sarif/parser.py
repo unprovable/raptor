@@ -148,8 +148,26 @@ def merge_sarif(sarif_paths: List[str]) -> Dict[str, Any]:
             if tool_name not in tool_runs:
                 tool_runs[tool_name] = {
                     "tool": run.get("tool", {}),
+                    # Track rules by id so we union the rule list across
+                    # same-tool runs without duplicates. Pre-fix the
+                    # `tool` block was set once (first run wins) and any
+                    # rules emitted in subsequent runs' tool.driver.rules
+                    # were silently dropped — downstream consumers
+                    # looking up `result.ruleId` against the merged
+                    # rule index missed those rules entirely (CWE
+                    # lookup, severity inheritance, etc. all returned
+                    # None for the dropped rules).
+                    "rules_by_id": {},
                     "results": {},  # keyed by _result_key for dedup
                 }
+            # Union this run's rules into the per-tool index. Same-id
+            # rules from later runs win on collision (matches the
+            # latest-occurrence-wins semantic the result dedup uses).
+            for rule in run.get("tool", {}).get("driver", {}).get("rules", []) or []:
+                if isinstance(rule, dict):
+                    rule_id = rule.get("id")
+                    if rule_id:
+                        tool_runs[tool_name]["rules_by_id"][rule_id] = rule
             for result in run.get("results", []):
                 key = _result_key(result)
                 tool_runs[tool_name]["results"][key] = result
@@ -157,8 +175,14 @@ def merge_sarif(sarif_paths: List[str]) -> Dict[str, Any]:
     # Build final SARIF with one run per tool
     merged_runs = []
     for tool_name, run_data in tool_runs.items():
+        # Re-inject the unioned rule list into tool.driver.rules.
+        tool_block = dict(run_data["tool"]) if run_data["tool"] else {}
+        driver = dict(tool_block.get("driver") or {})
+        if run_data["rules_by_id"]:
+            driver["rules"] = list(run_data["rules_by_id"].values())
+        tool_block["driver"] = driver
         merged_runs.append({
-            "tool": run_data["tool"],
+            "tool": tool_block,
             "results": list(run_data["results"].values()),
         })
 
