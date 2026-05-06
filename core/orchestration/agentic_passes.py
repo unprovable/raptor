@@ -646,9 +646,21 @@ def _convert_ruling(agentic_ruling, fp_reason) -> dict:
     false_positive_reason. Keeps the agentic ruling string as a separate
     field so the original verdict is preserved verbatim alongside the
     /validate-native status field.
+
+    When the input is already a dict, returns a DEEP COPY rather than
+    aliasing the original. Pre-fix the dict-input branch returned the
+    caller's reference unchanged. Downstream consumers writing into
+    `result.ruling.<field>` (status update, reason augmentation,
+    nested evidence push) would mutate the original /agentic
+    finding's ruling — which OTHER readers (per-finding telemetry,
+    consensus scoring, the finding-id-keyed rolled-up report) might
+    still be holding. Symptom: later log/report renderings showed
+    "ruling.reason" with content that should only have appeared in
+    the /validate post-pass, contaminating /agentic's verdict trace.
     """
     if isinstance(agentic_ruling, dict):
-        return agentic_ruling  # already in object shape
+        from copy import deepcopy
+        return deepcopy(agentic_ruling)
     ruling = {"status": agentic_ruling or "", "agentic_ruling": agentic_ruling or ""}
     if fp_reason:
         ruling["reason"] = fp_reason
