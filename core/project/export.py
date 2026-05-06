@@ -217,8 +217,25 @@ def import_project(zip_path: Path, projects_dir: Path,
                 logger.info(f"Removed existing project '{project_name}' (force=True)")
 
             # --- Extract output data ---
+            #
+            # Streaming extract with cumulative byte cap. Pre-fix
+            # `zf.extract(info, ...)` wrote the FULL decompressed
+            # file to disk before the size check ran. A zip-bomb
+            # entry with a small declared size but a 10 GB
+            # decompressed payload then materialised the entire
+            # 10 GB on disk before the cap caught it — fills the
+            # filesystem, may OOM if the entry is held in memory
+            # by the zlib backend, and leaves the partial file
+            # for cleanup.
+            #
+            # Streaming via `zf.open(info, "r")` + chunked read
+            # lets us check both the per-entry declared size AND
+            # the running cumulative bytes BEFORE writing each
+            # chunk to the destination. The per-chunk write
+            # short-circuits as soon as the cap is exceeded.
             output_dir.mkdir(parents=True, exist_ok=True)
             max_size = 10 * 1024 * 1024 * 1024  # 10GB
+            chunk = 1024 * 1024  # 1 MiB
             bytes_extracted = 0
             try:
                 for info in zf.infolist():
@@ -226,20 +243,40 @@ def import_project(zip_path: Path, projects_dir: Path,
                         continue
                     if info.is_dir():
                         continue
-                    extract_dest = output_base if has_common_root else output_dir
-                    extracted_path = Path(zf.extract(info, extract_dest))
-                    actual_size = extracted_path.stat().st_size
+                    # Refuse if the per-entry declared size alone
+                    # would exceed remaining budget — saves opening
+                    # a stream we'd immediately cancel.
+                    if bytes_extracted + info.file_size > max_size:
+                        raise ValueError(
+                            f"Entry {info.filename!r} ({info.file_size / 1024 / 1024:.0f}MB) "
+                            f"would exceed limit ({max_size / 1024 / 1024:.0f}MB)"
+                        )
+                    extract_dest = Path(output_base if has_common_root else output_dir)
+                    target_path = extract_dest / info.filename
+                    # Resolve and re-check containment — _check_zip_entries
+                    # already guards path traversal, but defence in depth
+                    # against a future regression in that helper.
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    actual_size = 0
+                    with zf.open(info, "r") as src, open(target_path, "wb") as dst:
+                        while True:
+                            buf = src.read(chunk)
+                            if not buf:
+                                break
+                            actual_size += len(buf)
+                            bytes_extracted += len(buf)
+                            if bytes_extracted > max_size:
+                                raise ValueError(
+                                    f"Extracted size ({bytes_extracted / 1024 / 1024:.0f}MB) "
+                                    f"exceeds limit ({max_size / 1024 / 1024:.0f}MB) "
+                                    f"during {info.filename!r}"
+                                )
+                            dst.write(buf)
                     if actual_size != info.file_size:
                         raise ValueError(
                             f"Size mismatch for {info.filename}: "
                             f"header says {info.file_size}, got {actual_size} "
                             f"(corrupted or malicious zip)"
-                        )
-                    bytes_extracted += actual_size
-                    if bytes_extracted > max_size:
-                        raise ValueError(
-                            f"Extracted size ({bytes_extracted / 1024 / 1024:.0f}MB) "
-                            f"exceeds limit ({max_size / 1024 / 1024:.0f}MB)"
                         )
             except Exception:
                 # Clean up partial extraction
