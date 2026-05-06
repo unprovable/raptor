@@ -16,6 +16,20 @@ from typing import Any, Dict, Optional
 from core.config import RaptorConfig
 
 
+# Reserved attribute names on `logging.LogRecord`. Any kwarg with a
+# colliding name passed via `extra=` causes
+# `logging.makeRecord` → `KeyError: "Attempt to overwrite '<name>'
+# in LogRecord"`. RaptorLogger filters these and renames colliders
+# with an `extra_` prefix.
+_RESERVED_LOGRECORD_NAMES = frozenset({
+    "name", "msg", "args", "levelname", "levelno",
+    "pathname", "filename", "module", "exc_info", "exc_text",
+    "stack_info", "lineno", "funcName", "created", "msecs",
+    "relativeCreated", "thread", "threadName", "processName",
+    "process", "message", "asctime",
+})
+
+
 class JSONFormatter(logging.Formatter):
     """Format log records as JSON for structured logging."""
 
@@ -119,33 +133,57 @@ class RaptorLogger:
 
         self.debug(f"RAPTOR logging initialized - audit trail: {log_file}")
 
-    def debug(self, message: str, **kwargs: Any) -> None:
-        """Log debug message."""
-        # Extract reserved parameters that must not be in extra dict
+    def _split_kwargs(self, kwargs: dict) -> tuple:
+        """Separate caller kwargs into:
+          * `exc_info` / `stack_info` (logger-call params).
+          * `extra` dict (the rest), with reserved LogRecord attribute
+            names filtered out.
+
+        Pre-fix only `exc_info` / `stack_info` were popped before
+        passing kwargs as `extra=`. Python's `logging.makeRecord`
+        raises KeyError if `extra` contains any name that collides
+        with a reserved LogRecord attribute (`name`, `message`,
+        `asctime`, `levelname`, `pathname`, `lineno`, `funcName`,
+        `created`, `msecs`, `relativeCreated`, `thread`, `threadName`,
+        `processName`, `process`, `args`, `levelno`, `module`,
+        `filename`, `exc_text`). A caller passing `logger.info("hi",
+        name="alice")` crashed with `KeyError: "Attempt to overwrite
+        'name' in LogRecord"` — common because `name` is a natural
+        kwarg name for many log payloads.
+
+        Filter and rename: collisions get prefixed with `extra_` so
+        the value still surfaces in the structured output instead
+        of crashing the call.
+        """
         exc_info = kwargs.pop('exc_info', False)
         stack_info = kwargs.pop('stack_info', False)
-        self.logger.debug(message, extra=kwargs, exc_info=exc_info, stack_info=stack_info)
+        extra = {}
+        for k, v in kwargs.items():
+            if k in _RESERVED_LOGRECORD_NAMES:
+                extra[f"extra_{k}"] = v
+            else:
+                extra[k] = v
+        return exc_info, stack_info, extra
+
+    def debug(self, message: str, **kwargs: Any) -> None:
+        """Log debug message."""
+        exc_info, stack_info, extra = self._split_kwargs(kwargs)
+        self.logger.debug(message, extra=extra, exc_info=exc_info, stack_info=stack_info)
 
     def info(self, message: str, **kwargs: Any) -> None:
         """Log info message."""
-        # Extract reserved parameters that must not be in extra dict
-        exc_info = kwargs.pop('exc_info', False)
-        stack_info = kwargs.pop('stack_info', False)
-        self.logger.info(message, extra=kwargs, exc_info=exc_info, stack_info=stack_info)
+        exc_info, stack_info, extra = self._split_kwargs(kwargs)
+        self.logger.info(message, extra=extra, exc_info=exc_info, stack_info=stack_info)
 
     def warning(self, message: str, **kwargs: Any) -> None:
         """Log warning message."""
-        # Extract reserved parameters that must not be in extra dict
-        exc_info = kwargs.pop('exc_info', False)
-        stack_info = kwargs.pop('stack_info', False)
-        self.logger.warning(message, extra=kwargs, exc_info=exc_info, stack_info=stack_info)
+        exc_info, stack_info, extra = self._split_kwargs(kwargs)
+        self.logger.warning(message, extra=extra, exc_info=exc_info, stack_info=stack_info)
 
     def error(self, message: str, **kwargs: Any) -> None:
         """Log error message."""
-        # Extract reserved parameters that must not be in extra dict
-        exc_info = kwargs.pop('exc_info', False)
-        stack_info = kwargs.pop('stack_info', False)
-        self.logger.error(message, extra=kwargs, exc_info=exc_info, stack_info=stack_info)
+        exc_info, stack_info, extra = self._split_kwargs(kwargs)
+        self.logger.error(message, extra=extra, exc_info=exc_info, stack_info=stack_info)
 
     def critical(self, message: str, **kwargs: Any) -> None:
         """Log critical message."""
