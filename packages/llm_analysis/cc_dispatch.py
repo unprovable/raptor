@@ -71,6 +71,21 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
                            caller_label="claude-sub-agent")
     except subprocess.TimeoutExpired:
         return DispatchResult(result={"error": f"timeout after {timeout}s"})
+    except (FileNotFoundError, PermissionError) as e:
+        # Pre-fix only TimeoutExpired was caught. If `claude_bin`
+        # was deleted/moved between the shutil.which() check at
+        # caller-time and the subprocess invocation, FileNotFoundError
+        # bubbled up as an uncaught exception and aborted the entire
+        # dispatch loop (every remaining finding errored out as
+        # "consecutive failures"). Same for permission flips on the
+        # sandbox binary or out_dir. Convert to a graceful error
+        # result so the loop continues.
+        return DispatchResult(result={"error": f"sandbox-launch failure: {e!r}"})
+    except OSError as e:
+        # Catch-all for low-level OS failures (resource exhaustion,
+        # ENOENT on a sandbox-internal path) — these are recoverable
+        # at the per-finding level even when persistent.
+        return DispatchResult(result={"error": f"OS error invoking sandbox: {e!r}"})
 
     if proc.returncode != 0:
         stderr_excerpt = (proc.stderr or "")[:500]
@@ -78,10 +93,23 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
         write_debug(out_dir, "dispatch", proc.stdout, proc.stderr, result)
         return DispatchResult(result=result)
 
-    if schema:
-        parsed = parse_cc_structured(proc.stdout, proc.stderr, "unknown")
-    else:
-        parsed = parse_cc_freeform(proc.stdout, proc.stderr)
+    # Parse with debug-on-failure. Pre-fix `parse_cc_structured` /
+    # `parse_cc_freeform` exceptions (malformed JSON, missing
+    # required envelope field, json.JSONDecodeError on `"...]"`
+    # truncated mid-array) propagated up, crashing the dispatch
+    # of THIS finding with no artifact saved — operators couldn't
+    # see what the subprocess actually wrote, only the Python
+    # traceback. write_debug here gives them the raw
+    # stdout/stderr to diagnose.
+    try:
+        if schema:
+            parsed = parse_cc_structured(proc.stdout, proc.stderr, "unknown")
+        else:
+            parsed = parse_cc_freeform(proc.stdout, proc.stderr)
+    except (ValueError, KeyError, TypeError) as e:
+        result = {"error": f"parse failure: {e!r}"}
+        write_debug(out_dir, "dispatch_parse", proc.stdout, proc.stderr, result)
+        return DispatchResult(result=result)
 
     cost = parsed.pop("cost_usd", 0)
     tokens = parsed.pop("_tokens", 0)
