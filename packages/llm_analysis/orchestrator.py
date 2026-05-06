@@ -1168,7 +1168,19 @@ def _merge_results(
     Matches by finding_id. CC results update analysis fields while
     preserving all prep data (code, dataflow, feasibility).
     """
-    merged = dict(prep_report)
+    # Deep-copy the entire prep_report. Pre-fix `dict(prep_report)`
+    # was a SHALLOW copy, leaving every nested dict (and the
+    # `metadata`, `summary`, `tools`, etc. top-level dicts) shared
+    # with the caller's prep_report object. Mutations to those
+    # nested structures (the per-finding mutations below were
+    # protected by a separate deepcopy on `results`, but
+    # downstream code that grew to touch other top-level keys —
+    # e.g. orchestration["defense_telemetry"] = ... in the
+    # caller, or summary statistics added in this function —
+    # leaked back into the caller's input). Doing one deepcopy
+    # at the boundary is also less error-prone than maintaining
+    # a per-key set of "things we copied" + "things we share".
+    merged = copy.deepcopy(prep_report)
     merged["mode"] = "orchestrated"
 
     # Index CC results by finding_id
@@ -1178,8 +1190,10 @@ def _merge_results(
         if fid:
             cc_by_id[fid] = r
 
-    # Deep copy results so we don't mutate the caller's data
-    results = copy.deepcopy(merged.get("results", []))
+    # `results` is already deep-copied via the top-level deepcopy
+    # above; no need for the duplicate copy that pre-fix code did
+    # (and which only protected `results`, not the rest of merged).
+    results = merged.get("results", [])
 
     # Merge into findings
     analysed = 0
