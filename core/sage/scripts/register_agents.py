@@ -399,9 +399,21 @@ async def register_agents(sage_url: str, dry_run: bool = False, force: bool = Fa
         pass
 
     sem = asyncio.Semaphore(_PROPOSE_CONCURRENCY)
-    results = await asyncio.gather(
-        *(_register_one(client, agent, force, sem) for agent in RAPTOR_AGENTS)
+    # `return_exceptions=True` for batch robustness — see seed_sage's
+    # equivalent fix for the rationale. A single _register_one failure
+    # used to abort the rest, leaving the operator with a half-
+    # registered set and no visibility into which agents made it.
+    raw_results = await asyncio.gather(
+        *(_register_one(client, agent, force, sem) for agent in RAPTOR_AGENTS),
+        return_exceptions=True,
     )
+    results = []
+    for agent, r in zip(RAPTOR_AGENTS, raw_results):
+        if isinstance(r, BaseException):
+            name = getattr(agent, "name", str(agent))
+            results.append((name, f"failed: {type(r).__name__}: {r}"))
+        else:
+            results.append(r)
 
     stored = sum(1 for _, status in results if status == "stored")
     partial = sum(1 for _, status in results if status == "partial")

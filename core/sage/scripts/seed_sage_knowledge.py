@@ -382,9 +382,26 @@ async def seed(sage_url: str, dry_run: bool = False, force: bool = False):
         pass
 
     sem = asyncio.Semaphore(_PROPOSE_CONCURRENCY)
-    results = await asyncio.gather(
-        *(_seed_one(client, mem, force, sem) for mem in all_memories)
+    # `return_exceptions=True` so a single _seed_one failure doesn't
+    # abort the entire batch. Pre-fix the gather would raise on the
+    # first exception, leaving the rest of the all_memories list
+    # un-seeded — operator had to re-run, again hitting the same
+    # failure and again losing visibility into the rest. Now each
+    # failed task surfaces as an Exception in `results`; the
+    # downstream classifier (status == "stored" / "skipped" /
+    # starts-with "failed") needs a None-or-Exception handling
+    # branch.
+    raw_results = await asyncio.gather(
+        *(_seed_one(client, mem, force, sem) for mem in all_memories),
+        return_exceptions=True,
     )
+    results = []
+    for mem, r in zip(all_memories, raw_results):
+        if isinstance(r, BaseException):
+            label = getattr(mem, "label", str(mem))
+            results.append((label, f"failed: {type(r).__name__}: {r}"))
+        else:
+            results.append(r)
 
     stored = sum(1 for _, status in results if status == "stored")
     skipped = sum(1 for _, status in results if status == "skipped")
