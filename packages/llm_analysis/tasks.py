@@ -292,7 +292,22 @@ class ConsensusTask(DispatchTask):
 
                 n_consensus = len(consensus_analyses)
                 if n_consensus == 1:
-                    final = primary_exploitable
+                    # 1-vote dispute: take the conservative max
+                    # (treat as exploitable if EITHER the primary
+                    # OR the consensus model says so). Pre-fix
+                    # the disputed case kept the primary verdict
+                    # silently — so when the consensus model
+                    # FLAGGED a previously-missed exploitable
+                    # path, the dispute was recorded for
+                    # operator review but the actual ruling
+                    # stayed "not exploitable" and the finding
+                    # was deprioritised. Conservative-max
+                    # matches CrossFamilyCheckTask's pattern
+                    # ("takes the conservative (exploitable)
+                    # verdict and flags `cross_family_disputed`")
+                    # so consensus and cross-family handle
+                    # disputes the same way.
+                    final = any(verdicts)  # True if any voter says exploitable
                 else:
                     final = sum(1 for v in verdicts if v) > len(verdicts) / 2
 
