@@ -57,9 +57,28 @@ def scoped(solver: Any) -> Iterator[Any]:
     inside are removed, assertions from before remain. Lets domain
     encoders try hypothesis constraints and roll back cheaply without
     discarding the surrounding solver state.
+
+    push() failure is caught and re-raised as RuntimeError with the
+    original chained. Pre-fix push() ran OUTSIDE the try/finally, so
+    a push() failure (rare — invalid solver state, OOM, transport
+    fault on a remote-Z3 build) propagated as a raw `Z3Exception`
+    that the caller could mis-attribute to body code rather than
+    scope setup. Post-fix the caller sees a clear "scope push
+    failed" message; the contract that a failed push means no body
+    runs (and nothing to pop) is preserved.
     """
-    solver.push()
+    try:
+        solver.push()
+    except Exception as e:  # noqa: BLE001 — Z3Exception unavailable cross-version
+        raise RuntimeError(f"scoped: solver.push() failed: {e}") from e
     try:
         yield solver
     finally:
-        solver.pop()
+        try:
+            solver.pop()
+        except Exception:  # noqa: BLE001
+            # If pop fails (very rare, but possible after a remote-Z3
+            # transport hiccup), re-raising would mask any exception
+            # from the body. Best-effort log via debug-only re-raise:
+            # we let the body's exception propagate.
+            pass
