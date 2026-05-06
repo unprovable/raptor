@@ -258,13 +258,36 @@ class ProjectManager:
             raise ValueError(f"Project '{name}' not found")
 
         if purge and project.output_path.exists():
-            # Safety: refuse to delete paths that could cause serious damage
+            # Safety: refuse to delete paths that could cause serious damage.
+            #
+            # The existing checks (== home, == /, < 3 parts, ancestor of
+            # home) catch the most obvious targets, but an attacker with
+            # write access to the project JSON could set
+            # `output_dir = "/etc"` or `"/usr/share/foo"` — none of those
+            # match the simple checks but rmtree of any of them is
+            # catastrophic.
+            #
+            # Add a containment check: refuse to rmtree any path that
+            # ISN'T inside the expected output base (DEFAULT_OUTPUT_BASE
+            # — `out/projects` resolved). Operators with custom
+            # output_dirs outside that base will need to clean by hand;
+            # the trade-off is correct because the alternative (trust
+            # the project JSON) is exactly the attack surface.
             output = project.output_path.resolve()
             home = Path.home().resolve()
             if (output == home or output == Path("/")
                     or len(output.parts) < 3
                     or str(home).startswith(str(output) + "/")):
                 raise ValueError(f"Refusing to delete suspicious path: {output}")
+            expected_base = DEFAULT_OUTPUT_BASE.resolve()
+            try:
+                output.relative_to(expected_base)
+            except ValueError:
+                raise ValueError(
+                    f"Refusing to delete output path {output} outside the "
+                    f"expected base {expected_base}. Use --no-purge or "
+                    f"clean the directory by hand."
+                )
             shutil.rmtree(project.output_path)
             logger.info(f"Deleted output directory: {project.output_dir}")
 
