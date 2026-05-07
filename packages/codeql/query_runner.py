@@ -652,15 +652,24 @@ class QueryRunner:
                     rule_id = result.get("ruleId", "unknown")
                     summary["by_rule"][rule_id] = summary["by_rule"].get(rule_id, 0) + 1
 
-                    # Count dataflow paths
+                    # Count dataflow paths. Pre-fix `+= 1` per
+                    # result conflated "findings WITH dataflow"
+                    # with "number of actual dataflow paths" —
+                    # a single finding often has multiple
+                    # codeFlows (alternative paths reaching the
+                    # same sink), each of which is a distinct
+                    # exploitable path. Operators reading the
+                    # summary saw "dataflow_paths: 12" and
+                    # assumed 12 distinct paths to triage; in
+                    # reality there could be 12 findings with
+                    # 30+ paths between them. Count one per
+                    # codeFlow so the metric matches the name.
                     code_flows = result.get("codeFlows", [])
-                    if code_flows:
-                        summary["dataflow_paths"] += 1
-                        # Count total steps in all dataflow paths for this finding
-                        for flow in code_flows:
-                            for thread_flow in flow.get("threadFlows", []):
-                                locations = thread_flow.get("locations", [])
-                                summary["total_dataflow_steps"] += len(locations)
+                    summary["dataflow_paths"] += len(code_flows)
+                    for flow in code_flows:
+                        for thread_flow in flow.get("threadFlows", []):
+                            locations = thread_flow.get("locations", [])
+                            summary["total_dataflow_steps"] += len(locations)
 
                 # Count queries
                 tool = run.get("tool", {})
