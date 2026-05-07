@@ -549,6 +549,71 @@ class TestDispatchTaskIntegration:
 
         assert results == []  # Skipped due to budget
 
+    def test_prefilter_short_circuits_skip_dispatch_fn(self):
+        """When ``prefilter_fn`` returns a result for an item the
+        dispatch_fn must NOT be called for it. The result becomes the
+        work item's result with cost=0/tokens=0 — the saving."""
+        findings = [_make_finding("f-001"), _make_finding("f-002")]
+        sc_dict = {
+            "is_true_positive": False, "is_exploitable": False,
+            "exploitability_score": 0.0,
+            "reasoning": "Fast-tier prefilter classified as false positive: x",
+        }
+        dispatch_calls = []
+
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            dispatch_calls.append(prompt)
+            return _make_dispatch_result(exploitable=True, score=0.9)
+
+        # Short-circuit f-001, fall through f-002.
+        def prefilter_fn(it):
+            if it["finding_id"] == "f-001":
+                return sc_dict
+            return None
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=mock_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=2,
+            prefilter_fn=prefilter_fn,
+        )
+
+        assert len(results) == 2
+        # f-002 dispatched, f-001 did not.
+        assert len(dispatch_calls) == 1
+        # The short-circuited result reflects the prefilter dict.
+        sc_result = next(r for r in results if r["finding_id"] == "f-001")
+        assert sc_result["is_true_positive"] is False
+        assert sc_result.get("cost_usd", 0.0) == 0.0
+
+    def test_prefilter_returns_none_runs_dispatch_normally(self):
+        """A prefilter that always returns ``None`` is a no-op — every
+        finding still hits dispatch_fn."""
+        findings = [_make_finding("f-001"), _make_finding("f-002")]
+        dispatch_calls = []
+
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            dispatch_calls.append(prompt)
+            return _make_dispatch_result(exploitable=True, score=0.9)
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=mock_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=2,
+            prefilter_fn=lambda _it: None,
+        )
+
+        assert len(results) == 2
+        assert len(dispatch_calls) == 2
+
 
 class TestRetryTask:
     def test_selects_low_confidence(self):
