@@ -860,7 +860,28 @@ class AutonomousCodeQLAnalyzer:
 
         # Save exploit
         if exploit_code:
-            exploit_ext = ".java" if "java" in finding.file_path.lower() else ".py"
+            # Pre-fix `"java" in finding.file_path.lower()` was a
+            # substring match — false-positively picked .java for:
+            #   * `*.js` (JavaScript — string contains "java")
+            #   * `MyJavaProject/foo.py` (path component "Java")
+            #   * `path/to/javadoc.txt`
+            # In each case the exploit was saved with `.java`
+            # extension under a Python-shaped naming scheme, then
+            # external tooling (`javac` / IDE association) failed
+            # on it. Pick by file extension via .endswith().
+            fp_lower = finding.file_path.lower()
+            if fp_lower.endswith(".java"):
+                exploit_ext = ".java"
+            elif fp_lower.endswith((".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs")):
+                exploit_ext = ".js"
+            elif fp_lower.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")):
+                exploit_ext = ".c"
+            elif fp_lower.endswith(".go"):
+                exploit_ext = ".go"
+            elif fp_lower.endswith((".rb",)):
+                exploit_ext = ".rb"
+            else:
+                exploit_ext = ".py"
             exploit_file = out_dir / f"{finding.rule_id}_{finding.start_line}_exploit{exploit_ext}"
             with open(exploit_file, 'w') as f:
                 f.write(exploit_code)
