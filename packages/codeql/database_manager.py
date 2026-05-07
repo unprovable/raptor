@@ -174,24 +174,61 @@ class DatabaseManager:
         except Exception:
             pass
 
-        # Fallback: hash directory structure and modification times.
-        # Iterative accumulator (mixing many inputs into one digest) so
-        # this stays on hashlib.sha256() — core.hash exposes only
-        # closed-form one-shot helpers. Filename .encode() calls below
-        # use surrogateescape to match core.hash's non-UTF-8 safety.
+        # Fallback: hash directory structure and file sizes (no
+        # mtime). Iterative accumulator (mixing many inputs into
+        # one digest) so this stays on hashlib.sha256() —
+        # core.hash exposes only closed-form one-shot helpers.
+        # Filename .encode() calls below use surrogateescape to
+        # match core.hash's non-UTF-8 safety.
+        #
+        # Pre-fix issues addressed here:
+        #   * `list(rglob("*"))` walked the ENTIRE tree first
+        #     then `[:1000]` sliced. For big repos with
+        #     node_modules / .venv / .git this enumerated
+        #     millions of files before discarding most. Use
+        #     os.walk with early-exit so we stop after collecting
+        #     1000 candidates.
+        #   * mtime in the hash invalidated the cache on any
+        #     `touch`-style write that didn't change content
+        #     (`make` rebuilds, editor saves with same content,
+        #     git checkout updates mtimes wholesale). Drop mtime;
+        #     keep (name, size) — same files at same sizes
+        #     produce the same hash regardless of touch noise.
+        #   * No filtering of known noise directories. Skip
+        #     .git / node_modules / .venv / __pycache__ / .tox /
+        #     dist / build / target — none are source-of-truth
+        #     for the database identity.
+        _SKIP_DIRS = {
+            ".git", "node_modules", ".venv", "venv", "__pycache__",
+            ".tox", "dist", "build", "target", ".idea", ".vscode",
+            ".gradle", ".mvn", ".cache", "coverage",
+        }
         hasher = hashlib.sha256()
         hasher.update(str(repo_path).encode("utf-8", errors="surrogateescape"))
 
-        # Hash a sample of files (for performance)
         try:
-            files = list(repo_path.rglob("*"))[:1000]  # Sample first 1000 files
-            for file_path in sorted(files):
+            collected: List[Path] = []
+            for dirpath, dirnames, filenames in os.walk(
+                repo_path, followlinks=False,
+            ):
+                # In-place prune skipped dirs from the walk to
+                # avoid even descending into them.
+                dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+                for name in filenames:
+                    collected.append(Path(dirpath) / name)
+                    if len(collected) >= 1000:
+                        break
+                if len(collected) >= 1000:
+                    break
+
+            for file_path in sorted(collected):
                 if file_path.is_file():
-                    hasher.update(str(file_path.relative_to(repo_path)).encode("utf-8", errors="surrogateescape"))
+                    hasher.update(
+                        str(file_path.relative_to(repo_path))
+                        .encode("utf-8", errors="surrogateescape"),
+                    )
                     try:
-                        stat = file_path.stat()
-                        hasher.update(str(stat.st_mtime).encode())
-                        hasher.update(str(stat.st_size).encode())
+                        hasher.update(str(file_path.stat().st_size).encode())
                     except OSError:
                         pass
         except Exception as e:
