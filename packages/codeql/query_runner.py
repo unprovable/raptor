@@ -309,21 +309,41 @@ class QueryRunner:
                     from pathlib import Path
                     codeql_cache = Path.home() / ".codeql"
                     codeql_cache.mkdir(parents=True, exist_ok=True)
-                    dl = sandbox_run(
-                        [self.codeql_cli, "pack", "download", pack_name],
-                        use_egress_proxy=True,
-                        proxy_hosts=[
-                            "ghcr.io",            # CodeQL packs hosted here
-                            "codeload.github.com",
-                            "objects.githubusercontent.com",
-                            "pkg-containers.githubusercontent.com",
-                        ],
-                        caller_label="codeql-pack-download",
-                        target=str(codeql_cache),
-                        output=str(codeql_cache),
-                        tool_paths=self._sandbox_tool_paths(),
-                        capture_output=True, text=True, timeout=120,
-                    )
+                    # Retry the download up to 3x with exponential
+                    # backoff. Pre-fix a single attempt — if the
+                    # registry was momentarily slow / a transient
+                    # 503 from ghcr.io / network blip, the whole
+                    # analysis dispatch failed and the operator
+                    # had to re-run the entire scan. Retries are
+                    # cheap (at most 3 sub-2-minute calls) and
+                    # cover the common transient failure modes.
+                    import time as _time
+                    dl = None
+                    for attempt in range(3):
+                        dl = sandbox_run(
+                            [self.codeql_cli, "pack", "download", pack_name],
+                            use_egress_proxy=True,
+                            proxy_hosts=[
+                                "ghcr.io",            # CodeQL packs hosted here
+                                "codeload.github.com",
+                                "objects.githubusercontent.com",
+                                "pkg-containers.githubusercontent.com",
+                            ],
+                            caller_label="codeql-pack-download",
+                            target=str(codeql_cache),
+                            output=str(codeql_cache),
+                            tool_paths=self._sandbox_tool_paths(),
+                            capture_output=True, text=True, timeout=120,
+                        )
+                        if dl.returncode == 0:
+                            break
+                        if attempt < 2:
+                            backoff = 2 ** attempt  # 1s, 2s
+                            logger.info(
+                                "Pack download attempt %d failed (rc=%d); "
+                                "retrying in %ds", attempt + 1, dl.returncode, backoff,
+                            )
+                            _time.sleep(backoff)
                     if dl.returncode == 0:
                         logger.info(f"✓ Downloaded {pack_name} — retrying analysis")
                         result = sandbox_run(
@@ -335,15 +355,25 @@ class QueryRunner:
                         )
                         success = result.returncode == 0
                     else:
-                        errors.append(f"Pack download failed: {dl.stderr[:200]}")
-                        logger.error(f"✗ Failed to download {pack_name}: {dl.stderr[:200]}")
+                        # `or ""` — sandbox_run can return None for
+                        # stderr when the captured stream was closed
+                        # before any output was written; pre-fix the
+                        # `[:200]` slice raised TypeError on None,
+                        # masking the original "download failed" with
+                        # an unrelated traceback.
+                        dl_stderr = (dl.stderr or "")[:200]
+                        errors.append(f"Pack download failed: {dl_stderr}")
+                        logger.error(f"✗ Failed to download {pack_name}: {dl_stderr}")
 
             if not success:
                 errors.append(f"Analysis failed with exit code {result.returncode}")
                 if result.stderr:
                     errors.append(result.stderr[:1000])
                 logger.error(f"✗ Analysis failed for {language}")
-                logger.error(result.stderr[:500])
+                # `or ""` for the same reason as above — `result.stderr`
+                # may be None on some sandbox failure modes (timeout
+                # mid-stream, killed before write).
+                logger.error((result.stderr or "")[:500])
 
                 return QueryResult(
                     success=False,
