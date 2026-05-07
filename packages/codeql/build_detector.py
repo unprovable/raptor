@@ -280,8 +280,34 @@ class BuildDetector:
                 matches = list(self.repo_path.rglob(f"*{build_file}"))
                 if matches:
                     detected_files.append(build_file)
-                    # Use the directory of the first match
-                    working_dir = matches[0].parent
+                    # Use the directory of the first match WITH
+                    # containment + executability checks. Pre-fix
+                    # `working_dir = matches[0].parent` blindly
+                    # used the rglob result, which on Python <
+                    # 3.13 follows symlinks — a symlink in the
+                    # repo pointing OUT to e.g. /etc could land
+                    # us with `working_dir = /etc` which codeql
+                    # can't cd into and which leaks the
+                    # operator's filesystem layout into logs.
+                    # X_OK check refuses dirs we can't actually
+                    # browse into.
+                    candidate = matches[0].parent
+                    try:
+                        cand_resolved = candidate.resolve(strict=False)
+                        repo_resolved = self.repo_path.resolve(strict=False)
+                        cand_resolved.relative_to(repo_resolved)
+                        if os.access(candidate, os.X_OK):
+                            working_dir = candidate
+                        else:
+                            logger.debug(
+                                "Skipping working_dir %s — not browseable",
+                                candidate,
+                            )
+                    except (ValueError, OSError):
+                        logger.debug(
+                            "Skipping out-of-tree working_dir candidate %s",
+                            candidate,
+                        )
 
         if not detected_files:
             return None
