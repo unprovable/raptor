@@ -276,14 +276,31 @@ class CodeQLAgent:
                 audit_run_dir=self.out_dir,
             )
 
-            # Clean up synthesised build artifacts
+            # Clean up synthesised build artifacts. Per-path try
+            # / except so one cleanup failure doesn't abort the
+            # whole sweep, and `is_dir()` / `is_file()` short-
+            # circuit if the path was already removed (idempotent
+            # under retry). `is_*` follows symlinks by default —
+            # use `follow_symlinks=False`-equivalent behaviour
+            # via `is_symlink()` short-circuit so we DELETE the
+            # symlink itself rather than its target (which could
+            # be in the user's repo or somewhere else entirely
+            # that we never put data into).
             import shutil
             for bs in language_build_map.values():
                 for p in getattr(bs, 'cleanup_paths', None) or []:
-                    if p.is_dir():
-                        shutil.rmtree(p)
-                    elif p.is_file():
-                        p.unlink()
+                    try:
+                        # Symlink → unlink the link, never follow.
+                        if p.is_symlink():
+                            p.unlink()
+                        elif p.is_dir():
+                            shutil.rmtree(p)
+                        elif p.is_file():
+                            p.unlink()
+                    except OSError as e:
+                        logger.debug(
+                            "cleanup of %s failed: %s — continuing", p, e,
+                        )
 
             # Check for failures
             successful_dbs = {
