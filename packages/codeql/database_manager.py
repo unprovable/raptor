@@ -19,7 +19,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -174,24 +174,61 @@ class DatabaseManager:
         except Exception:
             pass
 
-        # Fallback: hash directory structure and modification times.
-        # Iterative accumulator (mixing many inputs into one digest) so
-        # this stays on hashlib.sha256() — core.hash exposes only
-        # closed-form one-shot helpers. Filename .encode() calls below
-        # use surrogateescape to match core.hash's non-UTF-8 safety.
+        # Fallback: hash directory structure and file sizes (no
+        # mtime). Iterative accumulator (mixing many inputs into
+        # one digest) so this stays on hashlib.sha256() —
+        # core.hash exposes only closed-form one-shot helpers.
+        # Filename .encode() calls below use surrogateescape to
+        # match core.hash's non-UTF-8 safety.
+        #
+        # Pre-fix issues addressed here:
+        #   * `list(rglob("*"))` walked the ENTIRE tree first
+        #     then `[:1000]` sliced. For big repos with
+        #     node_modules / .venv / .git this enumerated
+        #     millions of files before discarding most. Use
+        #     os.walk with early-exit so we stop after collecting
+        #     1000 candidates.
+        #   * mtime in the hash invalidated the cache on any
+        #     `touch`-style write that didn't change content
+        #     (`make` rebuilds, editor saves with same content,
+        #     git checkout updates mtimes wholesale). Drop mtime;
+        #     keep (name, size) — same files at same sizes
+        #     produce the same hash regardless of touch noise.
+        #   * No filtering of known noise directories. Skip
+        #     .git / node_modules / .venv / __pycache__ / .tox /
+        #     dist / build / target — none are source-of-truth
+        #     for the database identity.
+        _SKIP_DIRS = {
+            ".git", "node_modules", ".venv", "venv", "__pycache__",
+            ".tox", "dist", "build", "target", ".idea", ".vscode",
+            ".gradle", ".mvn", ".cache", "coverage",
+        }
         hasher = hashlib.sha256()
         hasher.update(str(repo_path).encode("utf-8", errors="surrogateescape"))
 
-        # Hash a sample of files (for performance)
         try:
-            files = list(repo_path.rglob("*"))[:1000]  # Sample first 1000 files
-            for file_path in sorted(files):
+            collected: List[Path] = []
+            for dirpath, dirnames, filenames in os.walk(
+                repo_path, followlinks=False,
+            ):
+                # In-place prune skipped dirs from the walk to
+                # avoid even descending into them.
+                dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+                for name in filenames:
+                    collected.append(Path(dirpath) / name)
+                    if len(collected) >= 1000:
+                        break
+                if len(collected) >= 1000:
+                    break
+
+            for file_path in sorted(collected):
                 if file_path.is_file():
-                    hasher.update(str(file_path.relative_to(repo_path)).encode("utf-8", errors="surrogateescape"))
+                    hasher.update(
+                        str(file_path.relative_to(repo_path))
+                        .encode("utf-8", errors="surrogateescape"),
+                    )
                     try:
-                        stat = file_path.stat()
-                        hasher.update(str(stat.st_mtime).encode())
-                        hasher.update(str(stat.st_size).encode())
+                        hasher.update(str(file_path.stat().st_size).encode())
                     except OSError:
                         pass
         except Exception as e:
@@ -264,7 +301,11 @@ class DatabaseManager:
         # Check age
         try:
             created_at = datetime.fromisoformat(metadata.created_at)
-            age = datetime.now() - created_at
+            # Promote naive timestamps from pre-batch-396 metadata
+            # to UTC so the comparison below doesn't TypeError.
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - created_at
             if age > timedelta(days=max_age_days):
                 logger.debug(f"Cached database too old: {age.days} days")
                 return None
@@ -392,7 +433,11 @@ class DatabaseManager:
         else:
             try:
                 created_at = datetime.fromisoformat(metadata.created_at)
-                if datetime.now() - created_at > timedelta(days=max_age_days):
+                # Promote naive timestamps from pre-batch-396 metadata
+                # to UTC so the comparison below doesn't TypeError.
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - created_at > timedelta(days=max_age_days):
                     evict = True
             except (ValueError, AttributeError):
                 # Malformed metadata can't come from an in-flight writer
@@ -561,8 +606,20 @@ class DatabaseManager:
                 # if we reach the outer try — so guard create+write+chmod
                 # atomically here: clean up our own mess if any of the three
                 # raises, then re-raise so the caller still sees the error.
+                #
+                # `dir=` is `self.db_root / "tmp"`, NOT `working_dir`. Pre-fix
+                # the build script was written into the operator's REPO
+                # directory (`dir=working_dir`). On cleanup-failure paths
+                # (cleanup at line ~831 unlinks but only if exists; sandbox
+                # crashes mid-build skip it) the user found
+                # `.raptor_codeql_build_*.sh` files in their git checkout —
+                # `git status` noise, accidental `git add -A` commits,
+                # confused operators. Keep our scratch under our managed
+                # area where we control cleanup.
+                tmp_dir = self.db_root / "tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
                 fd, script_name = tempfile.mkstemp(
-                    prefix=".raptor_codeql_build_", suffix=".sh", dir=working_dir,
+                    prefix=".raptor_codeql_build_", suffix=".sh", dir=str(tmp_dir),
                 )
                 os.close(fd)
                 build_script = Path(script_name)
@@ -718,7 +775,13 @@ class DatabaseManager:
                 repo_hash=repo_hash,
                 repo_path=str(repo_path),
                 language=language,
-                created_at=datetime.now().isoformat(),
+                # Tz-aware UTC timestamp. Pre-fix `datetime.now()`
+                # was tz-naive — when serialised to ISO and later
+                # parsed by another runner in a different
+                # timezone, the comparison against `datetime.now()`
+                # (which would be a different tz-naive local time)
+                # produced silently-wrong age calculations.
+                created_at=datetime.now(timezone.utc).isoformat(),
                 codeql_version=self.get_codeql_version() or "unknown",
                 build_command=build_system.command if build_system else "",
                 build_system=build_system.type if build_system else "no-build",
@@ -875,19 +938,40 @@ class DatabaseManager:
                 logger.debug(f"Missing essential file: {file_name}")
                 return False
 
-        # Run codeql database check (optional, can be slow)
-        # Disabled by default for performance
-        # try:
-        #     result = subprocess.run(
-        #         [self.codeql_cli, "database", "check", str(db_path)],
-        #         capture_output=True,
-        #         timeout=30,
-        #     )
-        #     return result.returncode == 0
-        # except Exception:
-        #     return False
-
-        return True
+        # Pre-fix `codeql-database.yml` existence was the only
+        # check — easy for a half-built / corrupted database to
+        # pass (the yml is the FIRST thing CodeQL writes during
+        # build, so an aborted build leaves the yml in place
+        # but no actual DB content). Add a minimal-substance
+        # check: the database must have a `db-*` subdirectory
+        # (CodeQL writes per-language dbs as db-cpp, db-java,
+        # etc.) AND that subdir must be non-empty / non-trivial
+        # in size. Half-built databases typically have a few KB
+        # of yml/header but the multi-MB db-*/default/* trie
+        # files only land on successful build completion.
+        try:
+            db_subdirs = [d for d in db_path.iterdir()
+                          if d.is_dir() and d.name.startswith("db-")]
+            if not db_subdirs:
+                logger.debug(f"No db-* subdir in {db_path}")
+                return False
+            # At least one db-* subdir must hold > 100KB of data
+            # (the smallest realistic codeql DB observed in
+            # practice). Empty / kilobyte-sized = aborted build.
+            for sub in db_subdirs:
+                total_size = sum(
+                    f.stat().st_size for f in sub.rglob("*") if f.is_file()
+                )
+                if total_size > 100 * 1024:
+                    return True
+            logger.debug(
+                f"db-* subdirs present but trivially small in {db_path} "
+                f"(likely aborted build)",
+            )
+            return False
+        except OSError as e:
+            logger.debug(f"validate_database couldn't stat {db_path}: {e}")
+            return False
 
     def _count_database_files(self, db_path: Path) -> int:
         """Count files in database (for statistics)."""
@@ -914,7 +998,7 @@ class DatabaseManager:
             List of deleted database paths
         """
         logger.info(f"Cleaning up databases older than {days} days...")
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         deleted = []
 
         for repo_dir in self.db_root.iterdir():
@@ -928,6 +1012,11 @@ class DatabaseManager:
                     if data is None:
                         continue
                     created_at = datetime.fromisoformat(data["created_at"])
+                    # Promote naive timestamps from pre-batch-396
+                    # metadata to UTC so the cutoff comparison
+                    # doesn't TypeError.
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
 
                     if created_at < cutoff:
                         db_path = Path(data["database_path"])

@@ -212,8 +212,22 @@ class DataflowVisualizer:
     ) -> str:
         """Create HTML template with embedded visualization."""
 
-        nodes_json = json.dumps(nodes)
-        edges_json = json.dumps(edges)
+        # JSON-encode then defang `</` → `<\/` so any string in
+        # the data can't break out of the surrounding `<script>`
+        # block via a literal `</script>` substring. The browser's
+        # HTML parser searches for `</script>` regardless of JS
+        # string syntax — JSON encoding doesn't help (json.dumps
+        # produces `"</script>"` which is still `</script>` to
+        # the HTML parser). `<\/script>` is byte-equivalent in
+        # JS string literals (`\/` is just `/`) so the data round-
+        # trips identically; HTML parser sees `<\/script>` (not
+        # `</script>`) so the script context isn't closed.
+        # Same defence pattern OWASP recommends for any JSON
+        # embedded inline in `<script>...`.
+        def _safe_json(obj):
+            return json.dumps(obj).replace("</", "<\\/")
+        nodes_json = _safe_json(nodes)
+        edges_json = _safe_json(edges)
 
         return f"""<!DOCTYPE html>
 <html lang="en">
@@ -552,15 +566,31 @@ class DataflowVisualizer:
             }});
 
         function showNodeDetails(node) {{
+            // Build the structure with .html() for the static
+            // skeleton, then populate each text-bearing cell
+            // via .text() so user-controlled content (label,
+            // file path, snippet) gets DOM-text-encoded by the
+            // browser instead of parsed as HTML. Pre-fix every
+            // `${{node.<field>}}` interpolation went through
+            // `.html()` — server-side `escape()` partially
+            // mitigates but only for fields the Python side
+            // actually escaped (label and file weren't), and a
+            // payload like `<img src=x onerror=alert(1)>` from
+            // an unsanitised field renders as live HTML.
             const detailsDiv = d3.select("#node-details");
             detailsDiv.html(`
                 <div class="node-info">
-                    <h3>${{node.type.toUpperCase()}}</h3>
-                    <div class="location">${{node.file}}:${{node.line}}</div>
-                    <p style="margin-bottom: 10px; color: #d4d4d4;">${{node.label}}</p>
-                    <div class="code">${{node.code_context || node.snippet}}</div>
+                    <h3 class="r-type"></h3>
+                    <div class="location"><span class="r-file"></span>:<span class="r-line"></span></div>
+                    <p style="margin-bottom: 10px; color: #d4d4d4;" class="r-label"></p>
+                    <div class="code r-code"></div>
                 </div>
             `);
+            detailsDiv.select(".r-type").text(node.type.toUpperCase());
+            detailsDiv.select(".r-file").text(node.file || "");
+            detailsDiv.select(".r-line").text(node.line == null ? "" : String(node.line));
+            detailsDiv.select(".r-label").text(node.label || "");
+            detailsDiv.select(".r-code").text(node.code_context || node.snippet || "");
         }}
 
         // Show first node by default

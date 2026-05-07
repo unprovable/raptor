@@ -77,13 +77,37 @@ PATH_CONDITIONS_SCHEMA = {
     "unparseable": "list of strings — conditions too complex to express as simple predicates",
 }
 
-# Rule-id substrings that indicate a 32-bit integer-overflow reasoning mode.
-# Case-insensitive match; the list covers common CodeQL rule naming.
-_OVERFLOW_MARKERS = (
-    "cwe-190", "cwe-191", "cwe-680", "cwe-197",
-    "overflow", "underflow", "wraparound", "wrap-around",
-    "intoverflow", "integeroverflow", "integer-overflow",
+# Rule-id markers that indicate a 32-bit integer-overflow reasoning mode.
+# Pre-fix this was a tuple of bare substrings checked via `m in rule_lc`,
+# producing systematic false-positives:
+#
+#   * `"overflow"` matched `"buffer-overflow"`, `"stack-overflow"`,
+#     `"heap-overflow"` — all NON-integer overflow rules. CodeQL's
+#     buffer-overflow analysis benefits from 64-bit reasoning (pointer
+#     sizes), so demoting to 32-bit produced wrong SMT verdicts.
+#   * `"cwe-190"` matched `"cwe-1901"` (a hypothetical future CWE),
+#     and substring-matched any rule string containing that fragment.
+#   * `"underflow"` matched `"buffer-underflow"`.
+#
+# Use word-boundary regex so each marker matches only when it sits at
+# token boundaries (CodeQL rule IDs are slash/dash/dot separated).
+_OVERFLOW_MARKERS_RE = __import__("re").compile(
+    r"\b("
+    r"cwe-190|cwe-191|cwe-680|cwe-197|"
+    r"int(?:eger)?[-_]?overflow|int(?:eger)?[-_]?underflow|"
+    r"wrap(?:-?around)?|"
+    r"signed[-_]?(?:overflow|underflow)"
+    r")\b",
+    __import__("re").IGNORECASE,
 )
+
+
+def _is_overflow_rule(rule_id: str) -> bool:
+    """Word-boundary check whether the rule_id signals an integer
+    overflow/underflow rule. See _OVERFLOW_MARKERS_RE comment for
+    the false-positives this fixes (buffer-overflow / stack-overflow
+    / heap-overflow no longer demote to 32-bit reasoning)."""
+    return bool(_OVERFLOW_MARKERS_RE.search(rule_id or ""))
 
 
 def _infer_bv_profile(rule_id: Optional[str], llm_hint: Dict) -> BVProfile:
@@ -98,13 +122,29 @@ def _infer_bv_profile(rule_id: Optional[str], llm_hint: Dict) -> BVProfile:
     Any partial hint (e.g. width only) takes the LLM's value for the
     supplied field and fills the missing one from the heuristic default.
     """
-    rule_lc = (rule_id or "").lower()
-    heuristic_width = 32 if any(m in rule_lc for m in _OVERFLOW_MARKERS) else 64
+    heuristic_width = 32 if _is_overflow_rule(rule_id or "") else 64
     heuristic_signed = False  # unsigned is correct for most path conditions
 
     # Accept only sensible LLM-emitted values; ignore anything else.
+    # Pre-fix `raw_width > 0` accepted any positive int including
+    # absurd values (LLMs occasionally emit `width: 128`, `width:
+    # 1000`, or worse — `width: 1000000` once observed). Z3 would
+    # accept those technically but produce massively oversized
+    # bitvector encodings consuming GBs of memory and seconds
+    # per check. Clamp to the standard C-integer widths
+    # {8, 16, 32, 64}; anything else falls back to heuristic.
+    # `bool` excluded because `isinstance(True, int)` is True
+    # (subclass) and `True > 0` is True — a width=True hint
+    # would otherwise pass the gate.
     raw_width = llm_hint.get("width")
-    width = raw_width if isinstance(raw_width, int) and raw_width > 0 else heuristic_width
+    if (
+        isinstance(raw_width, int)
+        and not isinstance(raw_width, bool)
+        and raw_width in {8, 16, 32, 64}
+    ):
+        width = raw_width
+    else:
+        width = heuristic_width
 
     raw_signed = llm_hint.get("signed")
     signed = raw_signed if isinstance(raw_signed, bool) else heuristic_signed

@@ -38,7 +38,10 @@ class TestInferBVProfileHeuristic:
     @pytest.mark.parametrize("rule_id", [
         "cpp/cwe-190-integer-overflow",
         "CPP/CWE-190/ArithmeticOverflow",
-        "cpp/overflow-check-missing",
+        # batch 394 — `cpp/overflow-check-missing` removed: bare
+        # "overflow" alone no longer signals integer-overflow
+        # (false-positive driver — matched buffer-overflow,
+        # stack-overflow, heap-overflow, all NON-integer cases).
         "cpp/integer-overflow",
         "java/IntegerOverflow",
         "cpp/integeroverflow-in-loop",
@@ -67,13 +70,13 @@ class TestInferBVProfileHint:
         assert p.signed is False
 
     def test_hint_signed_only_combines_with_heuristic_width(self):
-        p = _infer_bv_profile("cpp/overflow-bug", {"signed": True})
+        p = _infer_bv_profile("cpp/integer-overflow-bug", {"signed": True})
         assert p.width == 32   # from heuristic (overflow rule)
         assert p.signed is True  # from hint
 
     def test_hint_beats_heuristic_when_both_supplied(self):
         # LLM says 64-bit signed even though rule would default to 32-bit unsigned.
-        p = _infer_bv_profile("cpp/overflow-bug", {"width": 64, "signed": True})
+        p = _infer_bv_profile("cpp/integer-overflow-bug", {"width": 64, "signed": True})
         assert p.width == 64
         assert p.signed is True
 
@@ -82,25 +85,25 @@ class TestInferBVProfileInvalidHints:
     """Garbage values in the hint dict must be ignored, not crash."""
 
     def test_string_width_ignored(self):
-        p = _infer_bv_profile("cpp/overflow-bug", {"width": "not-an-int"})
+        p = _infer_bv_profile("cpp/integer-overflow-bug", {"width": "not-an-int"})
         assert p.width == 32  # heuristic fallback, not ValueError
 
     def test_negative_width_ignored(self):
-        p = _infer_bv_profile("cpp/overflow-bug", {"width": -1})
+        p = _infer_bv_profile("cpp/integer-overflow-bug", {"width": -1})
         assert p.width == 32
 
     def test_zero_width_ignored(self):
-        p = _infer_bv_profile("cpp/overflow-bug", {"width": 0})
+        p = _infer_bv_profile("cpp/integer-overflow-bug", {"width": 0})
         assert p.width == 32
 
     def test_string_signed_ignored(self):
-        p = _infer_bv_profile("cpp/overflow-bug", {"signed": "yes"})
+        p = _infer_bv_profile("cpp/integer-overflow-bug", {"signed": "yes"})
         assert p.signed is False
 
     def test_none_values_ignored(self):
-        p = _infer_bv_profile("cpp/overflow-bug", {"width": None, "signed": None})
+        p = _infer_bv_profile("cpp/integer-overflow-bug", {"width": None, "signed": None})
         assert p.width == 32
 
     def test_missing_keys_tolerated(self):
-        p = _infer_bv_profile("cpp/overflow-bug", {})
+        p = _infer_bv_profile("cpp/integer-overflow-bug", {})
         assert p.width == 32

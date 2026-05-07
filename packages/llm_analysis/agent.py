@@ -13,6 +13,7 @@ This agent provides TRUE agentic behaviour with NO templates:
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -303,7 +304,9 @@ def convert_validated_to_agent_format(data: dict) -> List[Dict[str, Any]]:
     Skips ruled_out, confirmed_blocked, and unlikely-verdict findings.
     Normalizes status fields in-place before filtering (idempotent).
     """
-    from packages.exploitability_validation.models import Finding
+    from packages.exploitability_validation.models import (
+        Finding, EXPLOITABLE_FINAL_STATUSES,
+    )
 
     try:
         from packages.exploitability_validation import normalize_findings
@@ -330,7 +333,7 @@ def convert_validated_to_agent_format(data: dict) -> List[Dict[str, Any]]:
             "endLine": f.line,
             "snippet": f.proof.vulnerable_code,
             "message": f.candidate_reasoning or f.message or f.rule_id or f"{f.vuln_type} in {f.function or 'unknown'}",
-            "level": "error" if f.final_status in ("exploitable", "likely_exploitable", "confirmed_constrained") else "warning",
+            "level": "error" if f.final_status in EXPLOITABLE_FINAL_STATUSES else "warning",
             "has_dataflow": bool(f.proof.flow),
             "feasibility": feasibility_d,
             "attack_path_ref": f.feasibility.attack_path_ref,
@@ -513,7 +516,12 @@ class AutonomousSecurityAgentV2:
             logger.info(f"  Sanitizers effective: {validation.get('sanitizers_effective')}")
             logger.info(f"  Path reachable: {validation.get('path_reachable')}")
             logger.info(f"  Is exploitable: {validation.get('is_exploitable')}")
-            logger.info(f"  Confidence: {validation.get('exploitability_confidence', 0):.2f}")
+            # `.get(key, default)` only fires the default for MISSING keys;
+            # an explicit `null` from the LLM passes through as None, then
+            # `f"{None:.2f}"` raises TypeError mid-log-write and aborts
+            # the whole validate_dataflow call. Coalesce explicitly.
+            _conf = validation.get('exploitability_confidence')
+            logger.info(f"  Confidence: {(_conf if _conf is not None else 0):.2f}")
             logger.info(f"  Attack complexity: {validation.get('attack_complexity')}")
             logger.info(f"  False positive: {validation.get('false_positive')}")
 
@@ -667,14 +675,24 @@ class AutonomousSecurityAgentV2:
                         logger.info(f"⚠️  Validation determined NOT EXPLOITABLE:")
                         logger.info(f"    Reason: {(validation.get('exploitability_reasoning') or '')[:150]}")
                         vuln.exploitable = False
-                        vuln.exploitability_score = validation.get('exploitability_confidence', 0.0) * 0.5
+                        # Same null-vs-missing distinction as the
+                        # log site above — explicit None from the
+                        # LLM crashes `None * 0.5`.
+                        _conf = validation.get('exploitability_confidence')
+                        if _conf is None:
+                            _conf = 0.0
+                        vuln.exploitability_score = _conf * 0.5
                     else:
                         # Validation confirms exploitability
                         logger.info(f"✓ Validation confirms EXPLOITABLE")
-                        # Use validation confidence to refine score
+                        # Use validation confidence to refine score —
+                        # fall back to existing score if missing OR
+                        # explicit null (max(float, None) → TypeError).
+                        _conf = validation.get('exploitability_confidence')
+                        if _conf is None:
+                            _conf = vuln.exploitability_score
                         vuln.exploitability_score = max(
-                            vuln.exploitability_score,
-                            validation.get('exploitability_confidence', vuln.exploitability_score)
+                            vuln.exploitability_score, _conf,
                         )
 
                     # Store validation in analysis
@@ -854,33 +872,49 @@ class AutonomousSecurityAgentV2:
                 print("⚠️  LLM authentication failed — check your API key.")
             return False
 
-    def _extract_code(self, content: str) -> Optional[str]:
-        """Extract code from LLM response (handles markdown code blocks)."""
-        # Try to find C++ code block first
-        if "```cpp" in content:
-            parts = content.split("```cpp")
-            if len(parts) > 1:
-                code = parts[1].split("```")[0].strip()
-                return code
-        # Try to find C code block
-        elif "```c" in content:
-            parts = content.split("```c")
-            if len(parts) > 1:
-                code = parts[1].split("```")[0].strip()
-                return code
-        # Try to find Python code block
-        elif "```python" in content:
-            parts = content.split("```python")
-            if len(parts) > 1:
-                code = parts[1].split("```")[0].strip()
-                return code
-        elif "```" in content:
-            parts = content.split("```")
-            if len(parts) > 1:
-                code = parts[1].strip()
-                return code
+    # Match a markdown fenced code block. Captures the optional
+    # language tag and the body between fences. The language tag
+    # must end at a newline or the closing fence — pre-fix the
+    # plain `"```c" in content` substring check matched ```cpp,
+    # ```csharp, ```cmake, ```css, and even ```c++ as if they were
+    # the C-language branch (because "```c" is a prefix of all of
+    # them). Anchored on a per-line basis (re.MULTILINE) so prose
+    # text containing "```cpp" inline (`"like ```cpp would match"`)
+    # doesn't false-positive as a code block.
+    _CODE_FENCE_RE = re.compile(
+        r"^```(?P<lang>[a-zA-Z0-9_+-]*)\s*\n"
+        r"(?P<body>.*?)"
+        r"^```\s*$",
+        re.MULTILINE | re.DOTALL,
+    )
 
-        # If no code block, return content as-is
+    def _extract_code(self, content: str) -> Optional[str]:
+        """Extract code from LLM response (handles markdown code blocks).
+
+        Preference order: ```cpp > ```c > ```python > untagged
+        ``` > raw content. Pre-fix the substring matches conflated
+        ```cpp / ```csharp / ```cmake / ```css with ```c, and
+        matched ``` substrings inside prose as code blocks. The
+        regex requires the fence to be at line start and the
+        language tag to be a clean identifier ending at whitespace
+        / newline.
+        """
+        # Find every fenced block and choose by language tag.
+        blocks = list(self._CODE_FENCE_RE.finditer(content))
+        if blocks:
+            by_lang: Dict[str, str] = {}
+            for m in blocks:
+                lang = (m.group("lang") or "").lower()
+                # First occurrence per language wins (preserve order).
+                by_lang.setdefault(lang, m.group("body").rstrip())
+            for preferred in ("cpp", "c++", "c", "python", "py", ""):
+                if preferred in by_lang:
+                    return by_lang[preferred].strip()
+            # Fall back to the first block of any other language so
+            # captions like ```rust still extract.
+            return next(iter(by_lang.values())).strip()
+
+        # No code block — return content as-is.
         return content.strip()
 
     def _load_validated_findings(self, findings_path: str) -> List[Dict[str, Any]]:

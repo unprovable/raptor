@@ -327,7 +327,14 @@ class TestConsensusTask:
         assert prior["f-001"]["is_exploitable"] is False
         assert prior["f-001"]["consensus"] == "disputed"
 
-    def test_skips_false_positives(self):
+    def test_includes_false_positives_for_consensus(self):
+        # batch 361 — ConsensusTask now considers FP-flagged
+        # findings too so the consensus model can flag
+        # primary's hallucinated dismissals (false negatives
+        # in the safe direction). Pre-fix the
+        # `if not r.get("is_true_positive", True)` skip
+        # silently dropped them. Errors and cross-family-agreed
+        # are still skipped; only the FP filter is removed.
         task = ConsensusTask()
         findings = [_make_finding("f-001"), _make_finding("f-002"), _make_finding("f-003")]
         prior = {
@@ -336,8 +343,8 @@ class TestConsensusTask:
             "f-003": {"error": "failed"},
         }
         selected = task.select_items(findings, prior)
-        assert len(selected) == 1
-        assert selected[0]["finding_id"] == "f-001"
+        assert len(selected) == 2
+        assert {s["finding_id"] for s in selected} == {"f-001", "f-002"}
 
 
     def test_skips_cross_family_agreed(self):

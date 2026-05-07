@@ -6,6 +6,7 @@ Task subclasses define semantics: what prompt, what schema, which model.
 """
 
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
@@ -118,14 +119,54 @@ def _format_elapsed(seconds: float) -> str:
     return format_elapsed(seconds)
 
 
+# Word-boundary patterns for auth and classify_error keywords.
+# Pre-fix the substring `in lower` checks produced false positives:
+#   * `"401"` matched any error string containing the digits "401"
+#     anywhere — including stack-trace line numbers (`line 401, in
+#     ...`), HTTP status logs from unrelated endpoints, content-
+#     length headers, etc.
+#   * `"safety"` matched legitimate non-content-filter contexts
+#     ("safety check failed in tokenizer", "thread-safety
+#     violation", "safe to retry").
+#   * `"credit"` matched "credentials", "credit card validation",
+#     "discredit". The intent was billing-credit-exhausted but
+#     the substring caught everything credit-shaped.
+#   * `"refusal"` was OK as a substring; "refused request" was
+#     fine; but neither is reliably emitted by all providers.
+# Word-boundary regex via `\b...\b` keeps the keywords but
+# anchors them to token boundaries.
+_AUTH_KEYWORDS_RE = re.compile(
+    # Bare 401/403 only when preceded by a status-context word
+    # (HTTP, status, code) — "line 401" in a stack trace
+    # otherwise false-positives. Word words remain unconstrained.
+    r"\b((?:http|status|code)\s+40[13]\b|"
+    r"40[13]\s+(?:unauthorized|forbidden)|"
+    r"authentication|unauthorized|invalid api key|billing|"
+    r"quota|rate limit|insufficient_quota|credits?|"
+    r"api[_ ]?key (?:invalid|expired|missing))\b",
+    re.IGNORECASE,
+)
+
+_BLOCKED_KEYWORDS_RE = re.compile(
+    r"\b(content filter|blocked response|content (?:policy|safety) violation|"
+    r"refused (?:request|to respond)|response (?:was )?refused|"
+    r"safety filter|content blocked|moderation block)\b",
+    re.IGNORECASE,
+)
+
+_TIMEOUT_KEYWORDS_RE = re.compile(
+    r"\b(timeout|timed out|deadline exceeded|read timed? out)\b",
+    re.IGNORECASE,
+)
+
+
 def _is_auth_error(error_str: str) -> bool:
-    """Check if an error string indicates an authentication/billing failure."""
-    lower = error_str.lower()
-    return any(x in lower for x in [
-        "401", "403", "authentication", "unauthorized",
-        "invalid api key", "billing", "quota", "rate limit",
-        "insufficient_quota", "credit",
-    ])
+    """Check if an error string indicates an authentication/billing failure.
+
+    Word-boundary matched (see module-level RE comments) so a
+    "line 401, in foo" stack-trace fragment doesn't false-positive.
+    """
+    return bool(_AUTH_KEYWORDS_RE.search(error_str or ""))
 
 
 def _classify_error(error_str: str) -> str:
@@ -133,14 +174,16 @@ def _classify_error(error_str: str) -> str:
 
     Returns: 'blocked' (content filter/safety/refusal), 'auth' (key/billing/quota),
     'timeout', or 'error' (everything else).
+
+    Uses word-boundary regex matching — see module RE comments for
+    the substring false-positives this fixes.
     """
-    lower = error_str.lower()
-    if any(x in lower for x in ["content filter", "blocked response", "safety",
-                                 "refused request", "refusal"]):
+    text = error_str or ""
+    if _BLOCKED_KEYWORDS_RE.search(text):
         return "blocked"
-    if _is_auth_error(error_str):
+    if _is_auth_error(text):
         return "auth"
-    if any(x in lower for x in ["timeout", "timed out"]):
+    if _TIMEOUT_KEYWORDS_RE.search(text):
         return "timeout"
     return "error"
 
@@ -214,7 +257,13 @@ def dispatch_task(
     completed = 0
     running_cost = 0.0
     abort = False
-    consecutive_errors = 0
+    # Per-model state — see error path for the rationale (auth
+    # and consecutive-error tracking moved from global counters
+    # to per-model so a single bad credential or model-specific
+    # failure burst doesn't kill peer models' work).
+    _per_model_auth_fail: set = set()
+    _per_model_dead: set = set()
+    _per_model_state: Dict[str, Dict[str, int]] = {}
     start = time.monotonic()
     system_prompt = task.get_system_prompt()
 
@@ -293,7 +342,12 @@ def dispatch_task(
                 item_cost = processed.get("cost_usd", 0)
                 running_cost += item_cost
                 results.append(processed)
-                consecutive_errors = 0
+                # Reset this model's consecutive-failure counter
+                # — successful response means we're not in a
+                # death spiral for this model.
+                pm = _per_model_state.setdefault(model_key, {"consec": 0, "completed": 0})
+                pm["completed"] += 1
+                pm["consec"] = 0
 
                 # Record defense telemetry (nonce leakage, schema rejection)
                 with _nonces_lock:
@@ -368,7 +422,23 @@ def dispatch_task(
                     with _nonces_lock:
                         nonce = _nonces.pop((item_id, model_key), "")
                     if nonce:
-                        model_id = getattr(model, "model_name", str(model))
+                        # When dispatching via CC (model=None,
+                        # cc_dispatch.invoke_cc_simple), `model` is
+                        # None and pre-fix `getattr(None,
+                        # "model_name", str(None))` produced the
+                        # literal string "None" as the telemetry
+                        # model_id. Per-model telemetry counters
+                        # then attributed every CC schema failure
+                        # to a phantom model called "None" instead
+                        # of "claude-code". Coerce the CC case to
+                        # the canonical "claude-code" string so
+                        # failure telemetry matches the success
+                        # path's `analysed_by` attribution
+                        # (cc_dispatch.py sets it to "claude-code").
+                        if model is None:
+                            model_id = "claude-code"
+                        else:
+                            model_id = getattr(model, "model_name", str(model))
                         defense_telemetry.record_response(
                             model_id=model_id,
                             profile_name=profile_name,
@@ -378,19 +448,52 @@ def dispatch_task(
                             schema_retried=False,
                         )
 
+                # Per-model auth-failure tracking. Pre-fix any
+                # single auth error from ANY model aborted the
+                # WHOLE dispatch — so with multi-model dispatch
+                # (M models × N findings) a single bad credential
+                # on one model killed work in progress on every
+                # other valid model. Track per (model_key, "auth")
+                # and only abort when ALL models active for this
+                # task have hit auth errors.
                 if _is_auth_error(err_str):
-                    print("\n  Authentication/billing error — aborting remaining")
-                    abort = True
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
+                    _per_model_auth_fail.add(model_key)
+                    distinct_models = {_model_key(m) for m, _ in work}
+                    if _per_model_auth_fail >= distinct_models:
+                        print("\n  All models hit auth/billing errors — aborting remaining")
+                        abort = True
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    else:
+                        # Single-model auth failure — keep dispatching
+                        # to other models. Surface the per-model
+                        # failure but don't kill peers.
+                        print(f"  (model {model_key} auth-failed; continuing with other models)")
 
-                consecutive_errors += 1
-                if consecutive_errors >= 3 and completed == consecutive_errors:
-                    # Every result so far has failed — abort early
-                    print(f"\n  {consecutive_errors} consecutive failures — aborting remaining")
-                    abort = True
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
+                # Per-model consecutive_errors. Pre-fix the global
+                # counter triggered "3 consecutive failures" abort
+                # when one bad model's failures interleaved with
+                # other models' successes — with M models the
+                # round-robin scheduler frequently hit
+                # fail/fail/fail-from-same-model bursts that the
+                # GLOBAL counter saw as universal failure even
+                # when other models had succeeded between them.
+                # Per-model counter only triggers when this
+                # specific model has 3 consecutive failures
+                # AND every result for this model has been a
+                # failure.
+                pm = _per_model_state.setdefault(model_key, {"consec": 0, "completed": 0})
+                pm["completed"] += 1
+                pm["consec"] += 1
+                if pm["consec"] >= 3 and pm["completed"] == pm["consec"]:
+                    print(f"\n  Model {model_key}: {pm['consec']} consecutive failures — "
+                          "stopping dispatch to this model (others continue)")
+                    _per_model_dead.add(model_key)
+                    distinct_models = {_model_key(m) for m, _ in work}
+                    if _per_model_dead >= distinct_models:
+                        abort = True
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
 
     if abort:
         completed_ids = {r.get("finding_id") for r in results}

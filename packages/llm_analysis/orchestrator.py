@@ -538,8 +538,18 @@ def orchestrate(
                 full = (system_prompt + "\n\n" + prompt) if system_prompt else prompt
                 return invoke_cc_simple(full, schema, repo_path, claude_bin, out_dir)
 
+            # Carry the per-model intersected profile into the
+            # CC-fallback AnalysisTask. Pre-fix `AnalysisTask()`
+            # (no kwargs) used the default CONSERVATIVE profile,
+            # silently losing the defences the prior probe phase
+            # had validated for the actual model being dispatched.
+            # Most CC sub-agents are Claude → ANTHROPIC_CLAUDE
+            # (datamarking + base64_code enabled) so the fallback
+            # path was running with weaker defences than the
+            # primary path even though the same Claude model was
+            # behind it.
             analysis_results = dispatch_task(
-                AnalysisTask(), findings, dispatch_fn, role_resolution,
+                AnalysisTask(profile=profile), findings, dispatch_fn, role_resolution,
                 results_by_id, cost_tracker, max_parallel,
             )
 
@@ -647,6 +657,32 @@ def orchestrate(
     # ConsensusTask         → Second model votes (if configured)
     # ExploitTask/PatchTask → Generate code (only for final-verdict exploitable)
     # GroupAnalysisTask     → Cross-finding patterns
+
+    # Multi-model correlation (pure Python, no LLM) — precompute
+    # FIRST so downstream stages (cross-family check, retry,
+    # consensus, judge) can SEE the multi-model agreement signal
+    # when making their own decisions. Pre-fix correlation ran
+    # AFTER all those stages, meaning their inputs reflected only
+    # primary-model verdicts and they couldn't tell whether their
+    # incoming finding was a unanimous-positive (high confidence,
+    # less critique needed) vs disputed (high confidence, more
+    # scrutiny warranted). Correlation is also re-applied as
+    # confidence_signals onto results_by_id here so e.g.
+    # CrossFamilyCheckTask.select_items can prefer disputed
+    # findings when budgeting its picks.
+    #
+    # NOTE: correlation is recomputed at the end (line ~692) too,
+    # because consensus/retry update the per-model verdicts and
+    # the final report should reflect post-pipeline state. The
+    # PRECOMPUTE here is for input to downstream stages; the
+    # POST-COMPUTE is for output to operators.
+    early_correlation = None
+    if n_analysis_models > 1:
+        from packages.llm_analysis.correlation import correlate_results
+        early_correlation = correlate_results(results_by_id)
+        for fid, signal in early_correlation.get("confidence_signals", {}).items():
+            if fid in results_by_id:
+                results_by_id[fid]["multi_model_confidence"] = signal
 
     # Cross-family re-check: suspicious responses (low quality / nonce leaked)
     # re-dispatched through a model from a different training lineage.
@@ -870,6 +906,20 @@ def orchestrate(
 
     if defense_telemetry.has_warnings:
         merged["orchestration"]["defense_telemetry"] = defense_telemetry.summary()
+
+    # Strip the host-side `repo_path` we stamped onto every
+    # finding for SAGE enrichment scoping (line ~303). It's an
+    # absolute filesystem path on the operator's machine
+    # (`/home/alice/projects/my-target`, `/tmp/raptor/foo`) and
+    # leaking it into the persisted report exposes operator
+    # filesystem layout downstream — anyone the report is
+    # shared with sees username, project naming conventions,
+    # and the runner's tmp-dir hierarchy. Pop AFTER all
+    # internal consumers have used it (judge, consensus,
+    # aggregation) and BEFORE save_json hits disk.
+    for f in merged.get("results", []):
+        if isinstance(f, dict):
+            f.pop("repo_path", None)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     from core.json import save_json
@@ -1193,7 +1243,19 @@ def _merge_results(
     Matches by finding_id. CC results update analysis fields while
     preserving all prep data (code, dataflow, feasibility).
     """
-    merged = dict(prep_report)
+    # Deep-copy the entire prep_report. Pre-fix `dict(prep_report)`
+    # was a SHALLOW copy, leaving every nested dict (and the
+    # `metadata`, `summary`, `tools`, etc. top-level dicts) shared
+    # with the caller's prep_report object. Mutations to those
+    # nested structures (the per-finding mutations below were
+    # protected by a separate deepcopy on `results`, but
+    # downstream code that grew to touch other top-level keys —
+    # e.g. orchestration["defense_telemetry"] = ... in the
+    # caller, or summary statistics added in this function —
+    # leaked back into the caller's input). Doing one deepcopy
+    # at the boundary is also less error-prone than maintaining
+    # a per-key set of "things we copied" + "things we share".
+    merged = copy.deepcopy(prep_report)
     merged["mode"] = "orchestrated"
 
     # Index CC results by finding_id
@@ -1203,8 +1265,10 @@ def _merge_results(
         if fid:
             cc_by_id[fid] = r
 
-    # Deep copy results so we don't mutate the caller's data
-    results = copy.deepcopy(merged.get("results", []))
+    # `results` is already deep-copied via the top-level deepcopy
+    # above; no need for the duplicate copy that pre-fix code did
+    # (and which only protected `results`, not the rest of merged).
+    results = merged.get("results", [])
 
     # Merge into findings
     analysed = 0
@@ -1315,15 +1379,39 @@ def _structural_grouping(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for rule, fids in by_rule.items():
         _add_group("rule_id", rule, fids)
 
+    def _loc_key(d: Dict[str, Any]) -> Optional[str]:
+        """Build a `file:line` key from a dataflow node dict, or
+        return None if both fields are missing.
+
+        Pre-fix every site used `f"{d.get('file','?')}:{d.get('line','?')}"`
+        which produced the literal key `"?:?"` when both fields
+        were absent. ALL findings missing dataflow data then
+        clustered together under criterion_value=`?:?` — a
+        noise group with no analytical value, frequently the
+        biggest "structural" cluster in a scan because every
+        finding lacking dataflow extraction (most non-codeql
+        findings) landed there. Return None and let callers
+        skip the entry.
+        """
+        fp = d.get("file")
+        ln = d.get("line")
+        if not fp and ln in (None, ""):
+            return None
+        return f"{fp or '?'}:{ln if ln not in (None, '') else '?'}"
+
     # Group by shared sanitiser location
     by_sanitiser: Dict[str, List[str]] = {}
     for fid, r in findings_by_id.items():
         dataflow = r.get("dataflow") or {}
         for san in dataflow.get("sanitizers_found", []):
             if isinstance(san, dict):
-                loc = f"{san.get('file', '?')}:{san.get('line', '?')}"
+                loc = _loc_key(san)
+                if loc is None:
+                    continue
             else:
                 loc = str(san)
+                if not loc.strip():
+                    continue
             by_sanitiser.setdefault(loc, []).append(fid)
     for loc, fids in by_sanitiser.items():
         _add_group("sanitiser", loc, fids)
@@ -1334,7 +1422,9 @@ def _structural_grouping(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         dataflow = r.get("dataflow") or {}
         source = dataflow.get("source", {})
         if source:
-            loc = f"{source.get('file', '?')}:{source.get('line', '?')}"
+            loc = _loc_key(source)
+            if loc is None:
+                continue
             by_source.setdefault(loc, []).append(fid)
     for loc, fids in by_source.items():
         _add_group("dataflow_source", loc, fids)
@@ -1346,15 +1436,18 @@ def _structural_grouping(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         dataflow = r.get("dataflow") or {}
         source = dataflow.get("source", {})
         if source:
-            ref = f"{source.get('file', '?')}:{source.get('line', '?')}"
-            ref_to_fids.setdefault(ref, set()).add(fid)
+            ref = _loc_key(source)
+            if ref is not None:
+                ref_to_fids.setdefault(ref, set()).add(fid)
         for step in dataflow.get("steps", []):
-            ref = f"{step.get('file', '?')}:{step.get('line', '?')}"
-            ref_to_fids.setdefault(ref, set()).add(fid)
+            ref = _loc_key(step)
+            if ref is not None:
+                ref_to_fids.setdefault(ref, set()).add(fid)
         sink = dataflow.get("sink", {})
         if sink:
-            ref = f"{sink.get('file', '?')}:{sink.get('line', '?')}"
-            ref_to_fids.setdefault(ref, set()).add(fid)
+            ref = _loc_key(sink)
+            if ref is not None:
+                ref_to_fids.setdefault(ref, set()).add(fid)
 
     for ref, fids_set in ref_to_fids.items():
         _add_group("shared_dataflow_ref", ref, list(fids_set))

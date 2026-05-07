@@ -186,14 +186,25 @@ class AutonomousCodeQLAnalyzer:
         region = physical_loc.get("region", {})
         artifact = physical_loc.get("artifactLocation", {})
 
-        # Extract CWE
+        # Extract CWE. Pre-fix `for tag in tags: if tag.startswith(...)`
+        # raised AttributeError when SARIF emitters produced
+        # non-string tag values — properties.tags is supposed to
+        # be an array of strings per the SARIF spec, but real-
+        # world emitters (vendor packs, custom queries that mis-
+        # configure tags) sometimes ship dicts (`{"name": "..."}`)
+        # or numbers. The whole CWE-extraction branch then
+        # crashed mid-finding parse and the analysis aborted on
+        # that finding, often skipping every subsequent finding
+        # in the same SARIF file. isinstance() guard skips
+        # malformed tags and continues the loop.
         cwe = None
         properties = rule.get("properties", {})
         tags = properties.get("tags", [])
-        for tag in tags:
-            if tag.startswith("external/cwe/cwe-"):
-                cwe = tag.replace("external/cwe/", "").upper()
-                break
+        if isinstance(tags, list):
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("external/cwe/cwe-"):
+                    cwe = tag.replace("external/cwe/", "").upper()
+                    break
 
         # Check for dataflow
         code_flows = result.get("codeFlows", [])
@@ -231,7 +242,26 @@ class AutonomousCodeQLAnalyzer:
         Returns:
             Source code with context
         """
-        file_path = repo_path / finding.file_path
+        # Containment check on the joined path. `finding.file_path`
+        # comes from the CodeQL SARIF result — typically benign but
+        # a malicious target's `qlpack.yml` could produce a query
+        # whose result emits an absolute path or `../../etc/passwd`
+        # style traversal. `repo_path / "../../etc/passwd"` resolves
+        # OUT of `repo_path`, and the subsequent `open()` reads
+        # arbitrary host files which then get fed into the LLM
+        # prompt as "vulnerable code" — operator-visible
+        # disclosure.
+        try:
+            joined = (repo_path / finding.file_path).resolve(strict=False)
+            repo_resolved = repo_path.resolve(strict=False)
+            joined.relative_to(repo_resolved)  # raises ValueError if outside
+        except (ValueError, OSError) as e:
+            self.logger.warning(
+                "Refusing read_vulnerable_code on out-of-tree path %r: %s",
+                finding.file_path, e,
+            )
+            return finding.snippet
+        file_path = joined
 
         try:
             with open(file_path) as f:
@@ -841,7 +871,28 @@ class AutonomousCodeQLAnalyzer:
 
         # Save exploit
         if exploit_code:
-            exploit_ext = ".java" if "java" in finding.file_path.lower() else ".py"
+            # Pre-fix `"java" in finding.file_path.lower()` was a
+            # substring match — false-positively picked .java for:
+            #   * `*.js` (JavaScript — string contains "java")
+            #   * `MyJavaProject/foo.py` (path component "Java")
+            #   * `path/to/javadoc.txt`
+            # In each case the exploit was saved with `.java`
+            # extension under a Python-shaped naming scheme, then
+            # external tooling (`javac` / IDE association) failed
+            # on it. Pick by file extension via .endswith().
+            fp_lower = finding.file_path.lower()
+            if fp_lower.endswith(".java"):
+                exploit_ext = ".java"
+            elif fp_lower.endswith((".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs")):
+                exploit_ext = ".js"
+            elif fp_lower.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")):
+                exploit_ext = ".c"
+            elif fp_lower.endswith(".go"):
+                exploit_ext = ".go"
+            elif fp_lower.endswith((".rb",)):
+                exploit_ext = ".rb"
+            else:
+                exploit_ext = ".py"
             exploit_file = out_dir / f"{finding.rule_id}_{finding.start_line}_exploit{exploit_ext}"
             with open(exploit_file, 'w') as f:
                 f.write(exploit_code)

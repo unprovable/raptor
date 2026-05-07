@@ -50,7 +50,7 @@ Analyse this crash and provide:
 2. **exploitability_score** (float 0-1): Confidence that this is exploitable
 3. **crash_type** (string): Classify the crash (heap_overflow, stack_overflow, use_after_free, null_deref, format_string, integer_overflow, etc.)
 4. **severity_assessment** (string): low/medium/high/critical
-5. **cvss_estimate** (float): CVSS 3.1 base score estimate
+5. **cvss_score_estimate** (float): CVSS 3.1 base score estimate
 6. **attack_scenario** (string): Describe how an attacker would exploit this
 7. **exploitation_primitives** (list): What primitives are needed (arbitrary_write, controlled_pc, info_leak, etc.)
 8. **recommended_next_steps** (string): What to try for exploitation
@@ -355,7 +355,18 @@ class CrashAnalysisAgent:
             "exploitability_score": "float",
             "crash_type": "string",
             "severity_assessment": "string",
-            "cvss_estimate": "float",
+            # Renamed from `cvss_estimate` to align with the
+            # canonical schema name used by ANALYSIS_SCHEMA,
+            # exploitability_validation, and orchestrator
+            # consumers (see core/schema_constants.py — every
+            # other CVSS field across both /agentic and
+            # /validate is `cvss_score_estimate`). The bare
+            # `cvss_estimate` legacy spelling here meant the
+            # crash-agent's LLM was asked for one field while
+            # all other paths asked for another, and downstream
+            # mergers (json reports, judge prompts) failed to
+            # find the score on crash-agent results.
+            "cvss_score_estimate": "float",
             "attack_scenario": "string",
             "exploitation_primitives": "list",
             "recommended_next_steps": "string",
@@ -377,10 +388,34 @@ class CrashAnalysisAgent:
                 logger.info("No external LLM available — skipping crash analysis")
                 return False
 
+            # Validate response quality before consuming. Other
+            # dispatch paths run validate_structured_response
+            # to score completeness; this site bypassed it,
+            # consuming partially-empty / malformed analyses
+            # straight into crash_context. Add the same gate.
+            from core.llm.response_validation import validate_structured_response
+            validated = validate_structured_response(analysis, analysis_schema)
+            analysis = validated.data
+            if validated.quality < 0.3:
+                logger.warning(
+                    "Low-quality crash analysis (q=%.2f), incomplete: %s — "
+                    "consuming anyway but verdicts may be unreliable",
+                    validated.quality, validated.incomplete,
+                )
+
             # Update crash context
             crash_context.exploitability = "exploitable" if analysis.get("is_exploitable") else "not_exploitable"
             crash_context.crash_type = analysis.get("crash_type", "unknown")
-            crash_context.cvss_estimate = analysis.get("cvss_estimate", 0.0)
+            # Read the canonical name first, fall back to legacy
+            # for back-compat with cached analyses still using
+            # the old field name. crash_context attribute keeps
+            # its `cvss_estimate` name (purely internal — renaming
+            # would cascade across reports/binary_analysis).
+            crash_context.cvss_estimate = (
+                analysis.get("cvss_score_estimate")
+                or analysis.get("cvss_estimate")
+                or 0.0
+            )
             crash_context.analysis = analysis
 
             logger.info("✓ LLM analysis complete:")
@@ -388,9 +423,22 @@ class CrashAnalysisAgent:
             logger.info(f"  Exploitable: {analysis.get('is_exploitable', False)}")
             logger.info(f"  Crash Type: {analysis.get('crash_type', 'unknown')}")
             logger.info(f"  Severity: {analysis.get('severity_assessment', 'unknown')}")
-            logger.info(f"  CVSS: {analysis.get('cvss_estimate', 0.0)}")
-            if analysis.get('attack_scenario'):
-                logger.info(f"  Attack: {analysis.get('attack_scenario')[:150]}...")
+            logger.info(
+                f"  CVSS: {analysis.get('cvss_score_estimate', analysis.get('cvss_estimate', 0.0))}"
+            )
+            attack_scenario = analysis.get('attack_scenario')
+            if attack_scenario:
+                # Coerce to str — pre-fix `attack_scenario[:150]`
+                # silently sliced lists (returning the first 150
+                # elements as a list, then formatted via
+                # __repr__ — wrong shape for a log line) and
+                # raised TypeError on dicts/numbers. LLMs returning
+                # the wrong type for a "string" schema field
+                # happens frequently enough (lists of bullet
+                # points returned where prose was asked) that
+                # crashing the whole crash-analysis flow on a
+                # logging line is a poor failure mode.
+                logger.info(f"  Attack: {str(attack_scenario)[:150]}...")
             
             # Log some reasoning from the full response
             if full_response:

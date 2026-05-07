@@ -27,7 +27,25 @@ logger = get_logger()
 
 import re
 
-_PACK_NOT_FOUND_RE = re.compile(r"[Qq]uery pack ([\w/.-]+)\S* cannot be found")
+# Tightened from `[\w/.-]+\S*` which accepted any path-like
+# blob (path-traversal `../../etc/passwd`, multi-segment
+# `a/b/c/d`, leading-dot `..foo`). Pack names follow CodeQL's
+# canonical `<scope>/<name>` format: each segment starts and
+# ends with alphanumeric, contains only alphanumeric + dash +
+# (for the `<name>` half) dot/underscore. The downloaded pack
+# name flows into a CLI-arg execve here (`codeql pack download
+# <pack>`); even though codeql validates internally, accepting
+# operator-controlled strings into ANOTHER subprocess invocation
+# is a surface we don't need.
+_PACK_NOT_FOUND_RE = re.compile(
+    r"[Qq]uery pack "
+    r"([a-zA-Z0-9](?:[a-zA-Z0-9_-]*[a-zA-Z0-9])?/"
+    r"[a-zA-Z0-9](?:[a-zA-Z0-9_.-]*[a-zA-Z0-9])?)"
+    # Optional version (`@1.2.3`) or suite-path (`:suite/x.qls`)
+    # suffix that codeql appends — discarded, not captured.
+    r"(?:[@:][^\s]*)?"
+    r" cannot be found"
+)
 
 
 def _extract_missing_pack(stderr: str) -> str | None:
@@ -291,21 +309,41 @@ class QueryRunner:
                     from pathlib import Path
                     codeql_cache = Path.home() / ".codeql"
                     codeql_cache.mkdir(parents=True, exist_ok=True)
-                    dl = sandbox_run(
-                        [self.codeql_cli, "pack", "download", pack_name],
-                        use_egress_proxy=True,
-                        proxy_hosts=[
-                            "ghcr.io",            # CodeQL packs hosted here
-                            "codeload.github.com",
-                            "objects.githubusercontent.com",
-                            "pkg-containers.githubusercontent.com",
-                        ],
-                        caller_label="codeql-pack-download",
-                        target=str(codeql_cache),
-                        output=str(codeql_cache),
-                        tool_paths=self._sandbox_tool_paths(),
-                        capture_output=True, text=True, timeout=120,
-                    )
+                    # Retry the download up to 3x with exponential
+                    # backoff. Pre-fix a single attempt — if the
+                    # registry was momentarily slow / a transient
+                    # 503 from ghcr.io / network blip, the whole
+                    # analysis dispatch failed and the operator
+                    # had to re-run the entire scan. Retries are
+                    # cheap (at most 3 sub-2-minute calls) and
+                    # cover the common transient failure modes.
+                    import time as _time
+                    dl = None
+                    for attempt in range(3):
+                        dl = sandbox_run(
+                            [self.codeql_cli, "pack", "download", pack_name],
+                            use_egress_proxy=True,
+                            proxy_hosts=[
+                                "ghcr.io",            # CodeQL packs hosted here
+                                "codeload.github.com",
+                                "objects.githubusercontent.com",
+                                "pkg-containers.githubusercontent.com",
+                            ],
+                            caller_label="codeql-pack-download",
+                            target=str(codeql_cache),
+                            output=str(codeql_cache),
+                            tool_paths=self._sandbox_tool_paths(),
+                            capture_output=True, text=True, timeout=120,
+                        )
+                        if dl.returncode == 0:
+                            break
+                        if attempt < 2:
+                            backoff = 2 ** attempt  # 1s, 2s
+                            logger.info(
+                                "Pack download attempt %d failed (rc=%d); "
+                                "retrying in %ds", attempt + 1, dl.returncode, backoff,
+                            )
+                            _time.sleep(backoff)
                     if dl.returncode == 0:
                         logger.info(f"✓ Downloaded {pack_name} — retrying analysis")
                         result = sandbox_run(
@@ -317,15 +355,25 @@ class QueryRunner:
                         )
                         success = result.returncode == 0
                     else:
-                        errors.append(f"Pack download failed: {dl.stderr[:200]}")
-                        logger.error(f"✗ Failed to download {pack_name}: {dl.stderr[:200]}")
+                        # `or ""` — sandbox_run can return None for
+                        # stderr when the captured stream was closed
+                        # before any output was written; pre-fix the
+                        # `[:200]` slice raised TypeError on None,
+                        # masking the original "download failed" with
+                        # an unrelated traceback.
+                        dl_stderr = (dl.stderr or "")[:200]
+                        errors.append(f"Pack download failed: {dl_stderr}")
+                        logger.error(f"✗ Failed to download {pack_name}: {dl_stderr}")
 
             if not success:
                 errors.append(f"Analysis failed with exit code {result.returncode}")
                 if result.stderr:
                     errors.append(result.stderr[:1000])
                 logger.error(f"✗ Analysis failed for {language}")
-                logger.error(result.stderr[:500])
+                # `or ""` for the same reason as above — `result.stderr`
+                # may be None on some sandbox failure modes (timeout
+                # mid-stream, killed before write).
+                logger.error((result.stderr or "")[:500])
 
                 return QueryResult(
                     success=False,
@@ -587,22 +635,41 @@ class QueryRunner:
                 for result in run.get("results", []):
                     summary["total_findings"] += 1
 
-                    level = result.get("level", "warning")
+                    # Coerce to str — SARIF spec says `level` is a
+                    # string enum, but malformed emitters
+                    # occasionally produce ints (numeric severity)
+                    # or None. Pre-fix `summary["by_severity"][level]`
+                    # used the value as a dict key, so a dict-typed
+                    # tag (some custom queries return rich objects)
+                    # raised TypeError. None merged into one bucket
+                    # with the literal string "None" — confusing
+                    # later report consumers. Coerce defensively.
+                    raw_level = result.get("level", "warning")
+                    level = str(raw_level) if raw_level is not None else "warning"
                     summary["by_severity"][level] = summary["by_severity"].get(level, 0) + 1
 
                     # Count by rule
                     rule_id = result.get("ruleId", "unknown")
                     summary["by_rule"][rule_id] = summary["by_rule"].get(rule_id, 0) + 1
 
-                    # Count dataflow paths
+                    # Count dataflow paths. Pre-fix `+= 1` per
+                    # result conflated "findings WITH dataflow"
+                    # with "number of actual dataflow paths" —
+                    # a single finding often has multiple
+                    # codeFlows (alternative paths reaching the
+                    # same sink), each of which is a distinct
+                    # exploitable path. Operators reading the
+                    # summary saw "dataflow_paths: 12" and
+                    # assumed 12 distinct paths to triage; in
+                    # reality there could be 12 findings with
+                    # 30+ paths between them. Count one per
+                    # codeFlow so the metric matches the name.
                     code_flows = result.get("codeFlows", [])
-                    if code_flows:
-                        summary["dataflow_paths"] += 1
-                        # Count total steps in all dataflow paths for this finding
-                        for flow in code_flows:
-                            for thread_flow in flow.get("threadFlows", []):
-                                locations = thread_flow.get("locations", [])
-                                summary["total_dataflow_steps"] += len(locations)
+                    summary["dataflow_paths"] += len(code_flows)
+                    for flow in code_flows:
+                        for thread_flow in flow.get("threadFlows", []):
+                            locations = thread_flow.get("locations", [])
+                            summary["total_dataflow_steps"] += len(locations)
 
                 # Count queries
                 tool = run.get("tool", {})

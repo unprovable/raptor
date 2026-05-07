@@ -31,7 +31,23 @@ import logging
 import os
 import sys
 import time
-import xml.etree.ElementTree as ET
+# Use defusedxml for parsing target-repo XML files. Stdlib's
+# `xml.etree.ElementTree` is vulnerable to XXE / billion-laughs /
+# decompression-bomb attacks when fed adversarial XML — the SCA
+# pipeline reads XML files from untrusted target repositories
+# (operator's pom.xml may have been crafted by an attacker via
+# a malicious dependency, supply-chain compromise, or a deliberately
+# poisoned target). defusedxml.ElementTree wraps the same API but
+# disables external entity resolution, blocks billion-laughs, and
+# caps recursion. ImportError fallback keeps SCA working in
+# environments where defusedxml isn't installed (with a runtime
+# warning that XML parsing is using the unsafe stdlib).
+try:
+    import defusedxml.ElementTree as ET  # type: ignore[import-not-found]
+    _DEFUSED_XML = True
+except ImportError:
+    import xml.etree.ElementTree as ET
+    _DEFUSED_XML = False
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -147,16 +163,65 @@ def get_out_dir() -> Path:
     return Path(base).resolve() if base else Path("out").resolve()
 
 
+# Vendored / cache / build directories whose dependency manifests
+# describe TRANSITIVE deps already covered by the top-level
+# manifest, OR are vendored copies whose pin-shape doesn't reflect
+# the actual project's intent. Including them in SCA produces
+# noisy reports (the same `react@17.0.2` flagged 30x because every
+# transitive dep also depends on it) and breaks fix recommendations
+# (an "upgrade `lodash` to 4.17.21" suggestion against a
+# vendored-by-someone-else lodash isn't actionable).
+_VENDOR_DIR_NAMES = frozenset({
+    "node_modules", "vendor", ".venv", "venv", "__pycache__",
+    ".tox", "dist", "build", "target", ".gradle", ".mvn",
+    "site-packages", "bower_components", ".bundle", "Pods",
+    ".cache", ".idea", ".vscode",
+})
+
+
 def find_dependency_files(root: Path) -> List[Path]:
     candidates = []
     for pat in ['pom.xml', 'build.gradle', 'package.json',
                 'requirements.txt', 'pyproject.toml']:
         for p in root.rglob(pat):
+            # Skip if any path component is a vendor / cache dir.
+            # Pre-fix `rglob` walked into node_modules and friends,
+            # picking up every transitive dep's package.json,
+            # multiplying the SCA report by orders of magnitude
+            # (a typical npm project has 1000+ nested
+            # package.json files, each producing duplicate /
+            # not-actionable advisories).
+            try:
+                rel_parts = p.relative_to(root).parts
+            except ValueError:
+                rel_parts = p.parts
+            if any(part in _VENDOR_DIR_NAMES for part in rel_parts[:-1]):
+                continue
             candidates.append(p)
     return candidates
 
 
+_PARSE_POM_WARNED_UNSAFE = False
+
+
 def parse_pom(p):
+    global _PARSE_POM_WARNED_UNSAFE
+    if not _DEFUSED_XML and not _PARSE_POM_WARNED_UNSAFE:
+        # Warn once per process — operator should know they're
+        # parsing untrusted XML with the stdlib parser. Logging
+        # here rather than at import to avoid the warning when
+        # SCA isn't actually invoked.
+        try:
+            from core.logging import get_logger
+            get_logger("sca.agent").warning(
+                "defusedxml not installed — pom.xml parsing falls back to "
+                "xml.etree.ElementTree which is vulnerable to XXE / "
+                "billion-laughs in adversarial XML. `pip install defusedxml` "
+                "to enable safe parsing."
+            )
+        except Exception:
+            pass
+        _PARSE_POM_WARNED_UNSAFE = True
     try:
         tree = ET.parse(p)
         root = tree.getroot()
@@ -200,7 +265,17 @@ def parse_package_json(p):
 def main():
     ap = argparse.ArgumentParser(description='RAPTOR SCA Agent')
     ap.add_argument('--repo', required=True)
-    args = ap.parse_args()
+    # `parse_known_args` so callers (raptor.py orchestrator,
+    # `/agentic --sca`, future wrappers) can pass `--out`,
+    # `--project`, `--max-cost`, etc. without crashing this
+    # subcommand. Pre-fix `parse_args()` raised SystemExit on
+    # any unknown arg, breaking the wrapping orchestrator that
+    # passes through standard RAPTOR run-lifecycle flags. The
+    # extras are silently dropped here — they're either
+    # consumed by the wrapper (--out, --project) before this
+    # subcommand sees argv, or genuinely irrelevant to SCA
+    # (`--no-exploits`).
+    args, _unknown = ap.parse_known_args()
     repo = Path(args.repo).resolve()
     if not repo.exists():
         raise SystemExit('repo not found')
