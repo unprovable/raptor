@@ -19,7 +19,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -301,7 +301,11 @@ class DatabaseManager:
         # Check age
         try:
             created_at = datetime.fromisoformat(metadata.created_at)
-            age = datetime.now() - created_at
+            # Promote naive timestamps from pre-batch-396 metadata
+            # to UTC so the comparison below doesn't TypeError.
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - created_at
             if age > timedelta(days=max_age_days):
                 logger.debug(f"Cached database too old: {age.days} days")
                 return None
@@ -429,7 +433,11 @@ class DatabaseManager:
         else:
             try:
                 created_at = datetime.fromisoformat(metadata.created_at)
-                if datetime.now() - created_at > timedelta(days=max_age_days):
+                # Promote naive timestamps from pre-batch-396 metadata
+                # to UTC so the comparison below doesn't TypeError.
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - created_at > timedelta(days=max_age_days):
                     evict = True
             except (ValueError, AttributeError):
                 # Malformed metadata can't come from an in-flight writer
@@ -755,7 +763,13 @@ class DatabaseManager:
                 repo_hash=repo_hash,
                 repo_path=str(repo_path),
                 language=language,
-                created_at=datetime.now().isoformat(),
+                # Tz-aware UTC timestamp. Pre-fix `datetime.now()`
+                # was tz-naive — when serialised to ISO and later
+                # parsed by another runner in a different
+                # timezone, the comparison against `datetime.now()`
+                # (which would be a different tz-naive local time)
+                # produced silently-wrong age calculations.
+                created_at=datetime.now(timezone.utc).isoformat(),
                 codeql_version=self.get_codeql_version() or "unknown",
                 build_command=build_system.command if build_system else "",
                 build_system=build_system.type if build_system else "no-build",
@@ -951,7 +965,7 @@ class DatabaseManager:
             List of deleted database paths
         """
         logger.info(f"Cleaning up databases older than {days} days...")
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         deleted = []
 
         for repo_dir in self.db_root.iterdir():
@@ -965,6 +979,11 @@ class DatabaseManager:
                     if data is None:
                         continue
                     created_at = datetime.fromisoformat(data["created_at"])
+                    # Promote naive timestamps from pre-batch-396
+                    # metadata to UTC so the cutoff comparison
+                    # doesn't TypeError.
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
 
                     if created_at < cutoff:
                         db_path = Path(data["database_path"])
