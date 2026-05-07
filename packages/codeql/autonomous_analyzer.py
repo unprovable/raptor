@@ -186,14 +186,25 @@ class AutonomousCodeQLAnalyzer:
         region = physical_loc.get("region", {})
         artifact = physical_loc.get("artifactLocation", {})
 
-        # Extract CWE
+        # Extract CWE. Pre-fix `for tag in tags: if tag.startswith(...)`
+        # raised AttributeError when SARIF emitters produced
+        # non-string tag values — properties.tags is supposed to
+        # be an array of strings per the SARIF spec, but real-
+        # world emitters (vendor packs, custom queries that mis-
+        # configure tags) sometimes ship dicts (`{"name": "..."}`)
+        # or numbers. The whole CWE-extraction branch then
+        # crashed mid-finding parse and the analysis aborted on
+        # that finding, often skipping every subsequent finding
+        # in the same SARIF file. isinstance() guard skips
+        # malformed tags and continues the loop.
         cwe = None
         properties = rule.get("properties", {})
         tags = properties.get("tags", [])
-        for tag in tags:
-            if tag.startswith("external/cwe/cwe-"):
-                cwe = tag.replace("external/cwe/", "").upper()
-                break
+        if isinstance(tags, list):
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("external/cwe/cwe-"):
+                    cwe = tag.replace("external/cwe/", "").upper()
+                    break
 
         # Check for dataflow
         code_flows = result.get("codeFlows", [])
